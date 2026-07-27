@@ -17,7 +17,9 @@ except ImportError:
 
 # Constants for socket communication
 DEFAULT_PORT = 9877
-HOST = "0.0.0.0"
+# Bind to loopback only. The MCP server always runs on the same machine as Live,
+# so there is no reason to expose this control socket to the LAN.
+HOST = "127.0.0.1"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""

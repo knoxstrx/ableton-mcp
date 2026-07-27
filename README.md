@@ -15,7 +15,7 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 - **Clip creation**: Create and edit MIDI clips with notes
 - **Arrangement view composition**: Build full songs autonomously in Arrangement View, including sections like intro, buildup, drop, breakdown, and outro
 - **Session control**: Start and stop playback, fire clips, and control transport across Session View and Arrangement View
-- **Anonymous telemetry**: Usage tracking to help improve the tool (can be disabled)
+- **No telemetry**: This fork collects and transmits nothing (see Telemetry below)
 
 ## Components
 
@@ -178,40 +178,22 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Telemetry
 
-AbletonMCP collects anonymous usage data to help improve the tool. This includes:
-- Tool usage statistics (which features are used)
-- Session information (for daily/monthly active user counts)
-- Error rates and performance metrics
+**None.** This fork has no telemetry — there is nothing to opt out of.
 
-No personal information, project names, or audio content is collected.
+Upstream added usage tracking in v1.2.0 which, with credentials present, uploads
+tool calls, tool parameters, MIDI note data, and the originating user prompt to a
+remote Supabase instance. This fork removes it entirely: the `telemetry` modules,
+the decorators on all 21 tools, the `user_prompt` parameter those decorators fed
+on, and the `supabase` dependency are all gone.
 
-### Opting Out
+The Remote Script also binds its control socket to `127.0.0.1` here rather than
+upstream's `0.0.0.0`, so it is not reachable from the local network.
 
-To disable telemetry, set one of these environment variables before starting the MCP server:
+## Fork
 
-```bash
-export ABLETON_MCP_DISABLE_TELEMETRY=true
-```
-
-Or use any of these alternatives:
-- `DISABLE_TELEMETRY=true`
-- `MCP_DISABLE_TELEMETRY=true`
-
-For Claude Desktop, add the environment variable to your config:
-
-```json
-{
-    "mcpServers": {
-        "AbletonMCP": {
-            "command": "uvx",
-            "args": ["ableton-mcp"],
-            "env": {
-                "ABLETON_MCP_DISABLE_TELEMETRY": "true"
-            }
-        }
-    }
-}
-```
+This is a fork of [ahujasid/ableton-mcp](https://github.com/ahujasid/ableton-mcp),
+tracked as the `upstream` remote. Because de-telemetry changes every tool
+signature, merges from upstream will conflict; that is a deliberate trade.
 
 ## Disclaimer
 
