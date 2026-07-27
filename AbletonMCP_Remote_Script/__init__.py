@@ -358,6 +358,14 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_arrangement_clips":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_arrangement_clips(track_index)
+            # Read-only note read – no main-thread scheduling required
+            elif command_type == "get_clip_notes":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_clip_notes(track_index, clip_index)
+            # Read-only whole-session read – no main-thread scheduling required
+            elif command_type == "get_session_overview":
+                response["result"] = self._get_session_overview()
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -465,6 +473,103 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting track info: " + str(e))
             raise
     
+    def _safe_attr(self, obj, attr, default):
+        """Read obj.<attr>, returning default if the property doesn't exist or
+        isn't readable on this object (e.g. arm on a group track)."""
+        try:
+            return getattr(obj, attr)
+        except (AttributeError, TypeError, RuntimeError):
+            return default
+
+    def _get_session_overview(self):
+        """One batch read of the whole session: every track, its group
+        membership, devices and filled clip slots, plus returns and master.
+
+        This exists so a client never has to call get_track_info once per track
+        just to find which index 'BASS' is at — one socket round-trip instead
+        of N, and the answer is always current, so a stale hardcoded index map
+        gets corrected on sight.
+        """
+        try:
+            tracks = []
+
+            # Materialise the track list once and keep a strong reference to it.
+            # Live hands out a FRESH Python wrapper on every property access, so
+            # id() is unstable across accesses — and worse, once a temporary
+            # wrapper is collected its id gets recycled, so an id()-keyed map
+            # returns confidently WRONG parents (a child reporting a sibling's
+            # index) instead of no answer. Compare the objects instead.
+            track_list = list(self._song.tracks)
+
+            def index_of(other):
+                if other is None:
+                    return None
+                for candidate_index, candidate in enumerate(track_list):
+                    if candidate == other:
+                        return candidate_index
+                return None
+
+            for index, track in enumerate(track_list):
+                is_group = bool(self._safe_attr(track, "is_foldable", False))
+                has_midi = bool(self._safe_attr(track, "has_midi_input", False))
+
+                group = self._safe_attr(track, "group_track", None)
+                group_index = index_of(group)
+
+                clips = []
+                for slot_index, slot in enumerate(track.clip_slots):
+                    # Only filled slots — a wall of empty slots is exactly the
+                    # noise this tool exists to avoid.
+                    if not slot.has_clip:
+                        continue
+                    clip = slot.clip
+                    clips.append({
+                        "index": slot_index,
+                        "name": clip.name,
+                        "length": round(float(clip.length), 3),
+                        "is_midi_clip": bool(self._safe_attr(clip, "is_midi_clip", has_midi))
+                    })
+
+                tracks.append({
+                    "index": index,
+                    "name": track.name,
+                    "type": "group" if is_group else ("midi" if has_midi else "audio"),
+                    "is_group": is_group,
+                    "group_index": group_index,
+                    "mute": bool(self._safe_attr(track, "mute", False)),
+                    "solo": bool(self._safe_attr(track, "solo", False)),
+                    "arm": bool(self._safe_attr(track, "arm", False)),
+                    "devices": [d.name for d in track.devices],
+                    "clip_count": len(clips),
+                    "clips": clips
+                })
+
+            returns = []
+            for index, track in enumerate(self._song.return_tracks):
+                returns.append({
+                    "index": index,
+                    "name": track.name,
+                    "devices": [d.name for d in track.devices]
+                })
+
+            master = self._song.master_track
+            return {
+                "tempo": self._song.tempo,
+                "signature_numerator": self._song.signature_numerator,
+                "signature_denominator": self._song.signature_denominator,
+                "track_count": len(tracks),
+                "return_track_count": len(returns),
+                "tracks": tracks,
+                "return_tracks": returns,
+                "master_track": {
+                    "name": master.name,
+                    "devices": [d.name for d in master.devices]
+                }
+            }
+        except Exception as e:
+            self.log_message("Error getting session overview: " + str(e))
+            raise
+
     def _create_midi_track(self, index):
         """Create a new MIDI track at the specified index"""
         try:
@@ -581,6 +686,86 @@ class AbletonMCP(ControlSurface):
             return result
         except Exception as e:
             self.log_message("Error creating audio clip: " + str(e))
+            raise
+
+    def _get_clip_notes(self, track_index, clip_index):
+        """Read the MIDI notes out of a Session clip.
+
+        Uses clip.get_notes_extended() (Live 11+), NOT the deprecated
+        get_notes(). Note dicts mirror the _add_notes_to_clip write format
+        exactly — pitch, start_time, duration, velocity, mute — so a pattern
+        can be read, edited and written straight back.
+
+        Live's MidiNote also carries probability / velocity_deviation /
+        release_velocity, but the write path (set_notes) cannot set them, so
+        surfacing them here would produce notes that don't round-trip. Left out
+        deliberately.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+
+            clip_slot = track.clip_slots[clip_index]
+
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot {0} on track {1} ({2})".format(
+                    clip_index, track_index, track.name))
+
+            clip = clip_slot.clip
+
+            if not clip.is_midi_clip:
+                raise Exception(
+                    "Clip '{0}' is an audio clip — it has no MIDI notes".format(clip.name))
+
+            if not hasattr(clip, "get_notes_extended"):
+                raise Exception(
+                    "Clip.get_notes_extended is unavailable in this Ableton Live "
+                    "version. Requires Live 11 or newer."
+                )
+
+            # Read a window nothing can hide behind. Deriving it from
+            # length/end_marker/loop_end looks smarter but fails at exactly the
+            # case it's meant to catch: when the loop brace is dragged shorter
+            # than the material, all three markers agree on the SHORT value and
+            # the notes past them go silently missing. get_notes_extended just
+            # range-filters, so an absurd span costs nothing.
+            NOTE_TIME_SPAN = 1000000.0  # beats — ~138 hours at 120 BPM
+
+            # Signature: get_notes_extended(from_pitch, pitch_span, from_time, time_span).
+            # NOTE the argument order differs from the old get_notes().
+            notes = []
+            for note in clip.get_notes_extended(0, 128, 0.0, NOTE_TIME_SPAN):
+                notes.append({
+                    "pitch": int(note.pitch),
+                    # round() kills float noise like 2.0000000000000004
+                    "start_time": round(float(note.start_time), 6),
+                    "duration": round(float(note.duration), 6),
+                    "velocity": round(float(note.velocity), 3),
+                    "mute": bool(note.mute)
+                })
+
+            # Live's own note order isn't guaranteed; sort so the same clip
+            # always reads back identically.
+            notes.sort(key=lambda n: (n["start_time"], n["pitch"]))
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "clip_index": clip_index,
+                "clip_name": clip.name,
+                "clip_length": float(clip.length),
+                "signature_numerator": clip.signature_numerator,
+                "signature_denominator": clip.signature_denominator,
+                "note_count": len(notes),
+                "notes": notes
+            }
+        except Exception as e:
+            self.log_message("Error getting clip notes: " + str(e))
             raise
 
     def _add_notes_to_clip(self, track_index, clip_index, notes):

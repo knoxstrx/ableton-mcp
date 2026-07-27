@@ -3,6 +3,7 @@ from mcp.server.fastmcp import FastMCP, Context
 import socket
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -286,6 +287,122 @@ def get_track_info(ctx: Context, track_index: int) -> str:
         logger.error(f"Error getting track info from Ableton: {str(e)}")
         return f"Error getting track info: {str(e)}"
 
+# ── Session overview rendering ────────────────────────────────────────────────
+# get_session_overview answers "which index is BASS at?" in one socket call
+# instead of N get_track_info calls. The map below is the payload that matters —
+# rendered as text, because an indented map is far cheaper to read (for a human
+# or a small model) than the equivalent JSON. Pure functions; no Live involved.
+
+def _fmt_num(value) -> str:
+    """4.0 -> '4', 121.5 -> '121.5'. Keeps the map free of trailing zeros."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(number)) if number == int(number) else str(round(number, 3))
+
+
+def _return_label(index: int) -> str:
+    """Live labels return tracks A, B, C… — match what's on screen."""
+    return chr(ord("A") + index) if 0 <= index < 26 else str(index)
+
+
+def _track_depth(track: Dict[str, Any], by_index: Dict[int, Dict[str, Any]]) -> int:
+    """Nesting depth of a track inside group tracks.
+
+    Only counts a parent that actually IS a group track. A bad group_index once
+    rendered as perfectly plausible indentation, which hid the bug that produced
+    it — the map should stop indenting rather than invent structure.
+    """
+    depth = 0
+    seen = set()
+    parent = track.get("group_index")
+    while parent is not None and parent in by_index and parent not in seen:
+        if not by_index[parent].get("is_group"):
+            break
+        seen.add(parent)
+        depth += 1
+        parent = by_index[parent].get("group_index")
+    return depth
+
+
+def _render_session_overview(overview: Dict[str, Any]) -> str:
+    """Render the session as an indented track map, one line per track."""
+    tracks = overview.get("tracks") or []
+    returns = overview.get("return_tracks") or []
+    master = overview.get("master_track") or {}
+
+    lines = ["{0} BPM · {1}/{2} · {3} tracks · {4} returns".format(
+        _fmt_num(overview.get("tempo", 0)),
+        overview.get("signature_numerator", 4),
+        overview.get("signature_denominator", 4),
+        len(tracks),
+        len(returns))]
+
+    if not tracks:
+        lines.append("(no tracks)")
+    else:
+        by_index = {t["index"]: t for t in tracks}
+        cells = ["  " * _track_depth(t, by_index) + str(t.get("name", "")) for t in tracks]
+        width = min(max(len(c) for c in cells), 28)
+
+        for track, cell in zip(tracks, cells):
+            devices = ", ".join(track.get("devices") or []) or "no devices"
+            row = "{0:>3}  {1}  {2:<5}  [{3}]".format(
+                track.get("index"), cell.ljust(width), track.get("type", "?"), devices)
+
+            clips = track.get("clips") or []
+            if clips:
+                row += "  clips: " + ", ".join('{0}:"{1}"({2})'.format(
+                    c.get("index"), c.get("name", ""), _fmt_num(c.get("length", 0)))
+                    for c in clips)
+
+            flags = [name for name in ("mute", "solo", "arm") if track.get(name)]
+            if flags:
+                row += "  <" + " ".join(flags) + ">"
+
+            lines.append(row)
+
+    if returns:
+        lines.append("returns: " + ", ".join('{0} "{1}" [{2}]'.format(
+            _return_label(r.get("index", i)), r.get("name", ""),
+            ", ".join(r.get("devices") or []) or "no devices")
+            for i, r in enumerate(returns)))
+
+    lines.append("master: [{0}]".format(
+        ", ".join(master.get("devices") or []) or "no devices"))
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_session_overview(ctx: Context, summary_only: bool = False) -> str:
+    """
+    Read the whole session in one call: every track with its index, type, group
+    membership, devices and filled clip slots, plus the return tracks and master.
+
+    Use this FIRST, instead of calling get_track_info once per track to find
+    which index a track like 'BASS' sits at. It is also the way to catch a
+    stale track/index map — what this returns is always the current session.
+
+    Returns an indented track map (group children are indented under their
+    group), followed by the same data as JSON for exact values.
+
+    Parameters:
+    - summary_only: Set true to return only the track map and skip the JSON detail
+    """
+    try:
+        ableton = get_ableton_connection()
+        overview = ableton.send_command("get_session_overview")
+        text = _render_session_overview(overview)
+
+        if summary_only:
+            return text
+        return "{0}\n\n{1}".format(text, json.dumps(overview, indent=2))
+    except Exception as e:
+        logger.error(f"Error getting session overview: {str(e)}")
+        return f"Error getting session overview: {str(e)}"
+
 @mcp.tool()
 def create_midi_track(ctx: Context, index: int = -1) -> str:
     """
@@ -395,6 +512,242 @@ def add_notes_to_clip(
     except Exception as e:
         logger.error(f"Error adding notes to clip: {str(e)}")
         return f"Error adding notes to clip: {str(e)}"
+
+# ── MIDI note summary helpers ─────────────────────────────────────────────────
+# get_clip_notes returns the raw notes (round-trippable) *plus* a digest built
+# here, so a small local model can coach on a pattern without reading a wall of
+# JSON. Pure functions — nothing here touches Live.
+
+# Ableton shows MIDI 60 as C3, so octave = pitch // 12 - 2. Matching Live's own
+# display matters: these are the names the user sees in the clip editor.
+_PITCH_CLASSES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+# Krumhansl-Kessler key profiles. Correlating a duration-weighted pitch-class
+# histogram against all 24 rotations is the standard cheap key estimator.
+_KK_MAJOR = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
+_KK_MINOR = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
+
+# Coarsest first, and every straight grid before any triplet grid — otherwise a
+# straight pattern gets reported as the triplet grid that happens to contain it.
+_GRIDS = (
+    ("1/1", 4.0), ("1/2", 2.0), ("1/4", 1.0), ("1/8", 0.5),
+    ("1/16", 0.25), ("1/32", 0.125),
+    ("1/4T", 2.0 / 3.0), ("1/8T", 1.0 / 3.0), ("1/16T", 1.0 / 6.0),
+)
+_GRID_TOLERANCE = 1e-3
+
+
+def _note_name(pitch: int) -> str:
+    """MIDI pitch → Ableton-style note name (60 → 'C3')."""
+    return "{0}{1}".format(_PITCH_CLASSES[pitch % 12], pitch // 12 - 2)
+
+
+def _pearson(xs, ys) -> float:
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    dx = [x - mean_x for x in xs]
+    dy = [y - mean_y for y in ys]
+    denom = math.sqrt(sum(x * x for x in dx) * sum(y * y for y in dy))
+    if denom == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(dx, dy)) / denom
+
+
+def _estimate_key(weights: List[float]):
+    """Best-fitting major/minor key for a duration-weighted pitch-class histogram.
+
+    Returns None when there isn't enough tonal information to guess — drum
+    patterns, one-note basslines. A confidently wrong key would steer the
+    coaching, so silence beats a guess.
+    """
+    if sum(1 for w in weights if w > 0) < 3:
+        return None
+
+    scored = []
+    for tonic in range(12):
+        rotated = weights[tonic:] + weights[:tonic]
+        scored.append((_pearson(rotated, _KK_MAJOR), "{0} major".format(_PITCH_CLASSES[tonic])))
+        scored.append((_pearson(rotated, _KK_MINOR), "{0} minor".format(_PITCH_CLASSES[tonic])))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    best, runner_up = scored[0], scored[1]
+    # Correlation strength, so a caller can tell "this is clearly A minor" from
+    # "this is atonal and 24 keys fit equally badly". Verified against real
+    # clips: a written-in-key bassline scores ~0.88, random notes ~0.47.
+    confidence = round(best[0], 3)
+    if confidence >= 0.75:
+        strength = "strong"
+    elif confidence >= 0.6:
+        strength = "moderate"
+    else:
+        strength = "weak"
+
+    return {
+        "key": best[1],
+        "confidence": confidence,
+        "strength": strength,
+        "runner_up": runner_up[1],
+        "runner_up_confidence": round(runner_up[0], 3)
+    }
+
+
+def _detect_grid(onsets):
+    """Coarsest note grid every onset lands on, or None if they don't agree."""
+    for name, step in _GRIDS:
+        if all(abs(o / step - round(o / step)) < _GRID_TOLERANCE for o in onsets):
+            return name
+    return None
+
+
+def _summarize_notes(clip_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the human/LLM-readable digest for a get_clip_notes result."""
+    notes = clip_info.get("notes") or []
+    length = float(clip_info.get("clip_length") or 0.0)
+    numerator = clip_info.get("signature_numerator") or 4
+    denominator = clip_info.get("signature_denominator") or 4
+    # Live measures time in quarter notes, so a 6/8 bar is 3 beats long.
+    beats_per_bar = numerator * 4.0 / denominator
+    bars = round(length / beats_per_bar, 3) if beats_per_bar else 0.0
+    meter = "{0}/{1}".format(numerator, denominator)
+    span = "{0} bars ({1} beats, {2})".format(bars, round(length, 3), meter)
+
+    summary = {
+        "text": "",
+        "note_count": len(notes),
+        "length_beats": round(length, 3),
+        "length_bars": bars,
+        "time_signature": meter
+    }
+
+    if not notes:
+        summary["text"] = "Empty clip — no notes. {0}.".format(span)
+        return summary
+
+    muted_count = sum(1 for n in notes if n.get("mute"))
+    # Muted notes shouldn't sway the key or the range — unless every note is
+    # muted, in which case describing nothing would be less useful.
+    active = [n for n in notes if not n.get("mute")] or notes
+
+    pitches = [int(n["pitch"]) for n in active]
+    lowest, highest = min(pitches), max(pitches)
+
+    pitch_weights = [0.0] * 12
+    pitch_counts = {}
+    for note in active:
+        pc = int(note["pitch"]) % 12
+        pitch_weights[pc] += max(float(note.get("duration", 0.0)), 0.0)
+        name = _PITCH_CLASSES[pc]
+        pitch_counts[name] = pitch_counts.get(name, 0) + 1
+    # Fall back to counts if every note has zero duration (shouldn't happen,
+    # but a zero histogram would make the key estimate meaningless).
+    if sum(pitch_weights) == 0:
+        for note in active:
+            pitch_weights[int(note["pitch"]) % 12] += 1.0
+
+    onsets = sorted(set(round(float(n["start_time"]), 6) for n in active))
+    simultaneous = {}
+    for onset in [round(float(n["start_time"]), 6) for n in active]:
+        simultaneous[onset] = simultaneous.get(onset, 0) + 1
+    max_simultaneous = max(simultaneous.values())
+
+    velocities = [float(n.get("velocity", 0)) for n in active]
+    grid = _detect_grid(onsets)
+    key = _estimate_key(pitch_weights)
+    notes_per_bar = round(len(active) / bars, 2) if bars else None
+
+    summary.update({
+        "muted_count": muted_count,
+        "pitch_range": {
+            "lowest": _note_name(lowest),
+            "highest": _note_name(highest),
+            "lowest_midi": lowest,
+            "highest_midi": highest,
+            "span_semitones": highest - lowest
+        },
+        "pitch_classes": dict(sorted(pitch_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "likely_key": key,
+        "rhythm": {
+            "grid": grid or "off-grid",
+            "distinct_onsets": len(onsets),
+            "notes_per_bar": notes_per_bar
+        },
+        "velocity": {
+            "min": round(min(velocities), 1),
+            "max": round(max(velocities), 1),
+            "mean": round(sum(velocities) / len(velocities), 1)
+        },
+        "polyphony": {
+            "max_simultaneous": max_simultaneous,
+            "monophonic": max_simultaneous == 1
+        }
+    })
+
+    parts = [
+        "{0} notes".format(len(notes)),
+        span,
+        "{0}–{1}".format(_note_name(lowest), _note_name(highest)),
+    ]
+    if key:
+        parts.append("{0} ({1}{2})".format(
+            key["key"], key["confidence"],
+            ", weak" if key["strength"] == "weak" else ""))
+    parts.append("{0} grid".format(grid) if grid else "off-grid")
+    if notes_per_bar is not None:
+        parts.append("{0} notes/bar".format(notes_per_bar))
+    parts.append("monophonic" if max_simultaneous == 1 else "up to {0} at once".format(max_simultaneous))
+    parts.append("vel {0}–{1}".format(round(min(velocities)), round(max(velocities))))
+    if muted_count:
+        parts.append("{0} muted".format(muted_count))
+    summary["text"] = " · ".join(parts)
+
+    return summary
+
+
+@mcp.tool()
+def get_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    summary_only: bool = False
+) -> str:
+    """
+    Read the MIDI notes in a Session-view clip.
+
+    The read counterpart of add_notes_to_clip: notes come back with exactly the
+    keys that tool writes (pitch, start_time, duration, velocity, mute), so a
+    pattern can be read, edited, and written straight back.
+
+    The response leads with a "summary" digest — pitch range, note names,
+    density, rhythmic grid, velocity spread, likely key — then the raw "notes"
+    list. Read the summary when describing or critiquing a pattern; you only
+    need the raw notes when you intend to rewrite them.
+
+    Note names follow Ableton's convention (middle C = C3 = MIDI 60), so they
+    match what's shown in Live's clip editor.
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: The index of the clip slot containing the clip
+    - summary_only: Set true to skip the raw note list and return only the digest
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_clip_notes", {
+            "track_index": track_index,
+            "clip_index": clip_index
+        })
+
+        summary = _summarize_notes(result)
+        notes = result.pop("notes", [])
+        # Summary first, so a reader that truncates still gets the digest.
+        result["summary"] = summary
+        if not summary_only:
+            result["notes"] = notes
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting clip notes: {str(e)}")
+        return f"Error getting clip notes: {str(e)}"
 
 @mcp.tool()
 def set_clip_name(ctx: Context, track_index: int, clip_index: int, name: str) -> str:
