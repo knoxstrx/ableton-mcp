@@ -232,6 +232,16 @@ class AbletonMCP(ControlSurface):
         }
         
         try:
+            # Name-based addressing. Resolved ONCE, here, before any handler
+            # runs — so every track-addressed command gets it for free and
+            # there is exactly one place that decides "which track did you
+            # mean". See _resolve_track_index.
+            if isinstance(params, dict) and params.get("track_name"):
+                resolved_index = self._resolve_track_index(
+                    params.get("track_name"), params.get("track_type", "track"))
+                if resolved_index is not None:
+                    params["track_index"] = resolved_index
+
             # Route the command to the appropriate handler
             if command_type == "get_session_info":
                 response["result"] = self._get_session_info()
@@ -498,6 +508,41 @@ class AbletonMCP(ControlSurface):
         except (AttributeError, TypeError, RuntimeError):
             return default
 
+    def _safe_color(self, obj):
+        """A Live colour as a plain int (0xRRGGBB), or None where unreadable.
+
+        Kept as the raw int on purpose: naming a colour is presentation, and
+        presentation lives in server.py, which reloads without a Live restart.
+        """
+        try:
+            return int(self._safe_attr(obj, "color", None))
+        except (TypeError, ValueError):
+            return None
+
+    def _read_scenes(self):
+        """Scene names, in order.
+
+        Scenes are how an arrangement gets scaffolded (IDEA / GROOVE / BREAK /
+        PEAK in the template) and nothing read them before, so checking they
+        were named right was a by-eye job. Live returns "" for an unnamed
+        scene and shows a number instead; that empty string is reported as-is
+        rather than faked into a name.
+        """
+        scenes = []
+        try:
+            scene_list = list(self._song.scenes)
+        except (AttributeError, TypeError, RuntimeError):
+            return scenes
+
+        for index, scene in enumerate(scene_list):
+            scenes.append({
+                "index": index,
+                "name": str(self._safe_attr(scene, "name", "")),
+                "color": self._safe_color(scene),
+                "is_empty": bool(self._safe_attr(scene, "is_empty", True))
+            })
+        return scenes
+
     def _get_session_overview(self):
         """One batch read of the whole session: every track, its group
         membership, devices and filled clip slots, plus returns and master.
@@ -556,6 +601,7 @@ class AbletonMCP(ControlSurface):
                     "mute": bool(self._safe_attr(track, "mute", False)),
                     "solo": bool(self._safe_attr(track, "solo", False)),
                     "arm": bool(self._safe_attr(track, "arm", False)),
+                    "color": self._safe_color(track),
                     "devices": [d.name for d in track.devices],
                     "clip_count": len(clips),
                     "clips": clips
@@ -566,6 +612,7 @@ class AbletonMCP(ControlSurface):
                 returns.append({
                     "index": index,
                     "name": track.name,
+                    "color": self._safe_color(track),
                     "devices": [d.name for d in track.devices]
                 })
 
@@ -578,6 +625,7 @@ class AbletonMCP(ControlSurface):
                 "return_track_count": len(returns),
                 "tracks": tracks,
                 "return_tracks": returns,
+                "scenes": self._read_scenes(),
                 "master_track": {
                     "name": master.name,
                     "devices": [d.name for d in master.devices]
@@ -600,6 +648,73 @@ class AbletonMCP(ControlSurface):
             return float(getattr(obj, attr))
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return default
+
+    # ── Track addressing by name ─────────────────────────────────────────────
+    # Indices are fragile: adding one group track to the template moved BASS
+    # from 4 to 7 and silently invalidated every hardcoded map pointing at it.
+    # Names survive reordering, so every track-addressed command accepts an
+    # optional track_name that wins over track_index.
+    #
+    # The resolver NEVER guesses. Two tracks called PERC is exactly the
+    # wrong-track write this is meant to prevent, so ambiguity raises with the
+    # full list of names rather than picking the first hit — the same principle
+    # as the overview renderer refusing to indent under a non-group.
+
+    def _track_collection(self, track_type):
+        """The Live track list a track_type refers to, plus a label for errors."""
+        kind = str(track_type or "track").lower()
+        if kind in ("master", "master_track"):
+            return None, "master"
+        if kind in ("return", "return_track", "returns"):
+            return list(self._song.return_tracks), "return track"
+        if kind in ("track", "tracks", "regular", ""):
+            return list(self._song.tracks), "track"
+        raise ValueError(
+            "Unknown track_type '{0}' — use 'track', 'return' or 'master'".format(track_type))
+
+    def _resolve_track_index(self, track_name, track_type="track"):
+        """Turn a track NAME into its index.
+
+        Exact (case-insensitive) match wins. Failing that, a UNIQUE substring
+        match wins, so "reverb short" finds "A-Reverb Short". Anything ambiguous
+        or unmatched raises with every available name attached, because the
+        useful error here is the one that shows the caller what it could have
+        said instead.
+
+        Returns None for track_type "master" — the master has no index, and the
+        caller's track_index is ignored for it anyway.
+        """
+        collection, label = self._track_collection(track_type)
+        if collection is None:
+            return None
+
+        wanted = str(track_name).strip().lower()
+        if not wanted:
+            raise ValueError("track_name is empty")
+
+        names = [str(self._safe_attr(track, "name", "")) for track in collection]
+        catalogue = ", ".join('{0}:"{1}"'.format(i, n) for i, n in enumerate(names))
+
+        exact = [i for i, n in enumerate(names) if n.strip().lower() == wanted]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise ValueError(
+                "Track name '{0}' is ambiguous — {1}s {2} all have that name. "
+                "Rename one, or use track_index.".format(
+                    track_name, label, ", ".join(str(i) for i in exact)))
+
+        partial = [i for i, n in enumerate(names) if wanted in n.strip().lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            raise ValueError(
+                "Track name '{0}' matches {1} {2}s: {3}. Be more specific.".format(
+                    track_name, len(partial), label,
+                    ", ".join('{0}:"{1}"'.format(i, names[i]) for i in partial)))
+
+        raise ValueError(
+            "No {0} named '{1}'. The set has: {2}".format(label, track_name, catalogue))
 
     def _resolve_track(self, track_index, track_type):
         """Address a regular track, a return track or the master.
@@ -700,6 +815,39 @@ class AbletonMCP(ControlSurface):
             "sends": sends
         }
 
+    def _read_drum_pads(self, device):
+        """The note → pad-name map of a Drum Rack.
+
+        This is the piece that makes an AI able to WRITE a drum part: knowing a
+        rack has 10 pads is useless, knowing "Bongo" answers to note 39 is the
+        whole game. Deliberately NOT behind include_chains — the map is small
+        and high-value, whereas the devices inside each pad are neither.
+
+        Live exposes all 128 pads whether or not anything is loaded, so pads
+        with no chain are skipped; an empty pad is not a playable note.
+        """
+        pads = []
+        try:
+            pad_list = list(device.drum_pads)
+        except (AttributeError, TypeError, RuntimeError):
+            return pads
+
+        for pad in pad_list:
+            try:
+                if not list(self._safe_attr(pad, "chains", [])):
+                    continue
+            except (TypeError, RuntimeError):
+                continue
+            pads.append({
+                "note": int(self._safe_float(pad, "note", -1)),
+                "name": str(self._safe_attr(pad, "name", "")),
+                "mute": bool(self._safe_attr(pad, "mute", False)),
+                "solo": bool(self._safe_attr(pad, "solo", False))
+            })
+
+        pads.sort(key=lambda entry: entry["note"])
+        return pads
+
     def _read_device(self, device, index, include_chains, depth):
         """One device: its identity, on/off state, and its parameters."""
         try:
@@ -734,6 +882,9 @@ class AbletonMCP(ControlSurface):
             except (AttributeError, TypeError, RuntimeError):
                 chain_list = []
 
+        can_have_drum_pads = bool(self._safe_attr(device, "can_have_drum_pads", False))
+        drum_pads = self._read_drum_pads(device) if can_have_drum_pads else []
+
         info = {
             "index": index,
             "name": str(self._safe_attr(device, "name", "")),
@@ -741,8 +892,10 @@ class AbletonMCP(ControlSurface):
             "type": self._get_device_type(device),
             "is_active": None if is_active is None else bool(is_active),
             "can_have_chains": can_have_chains,
-            "can_have_drum_pads": bool(self._safe_attr(device, "can_have_drum_pads", False)),
+            "can_have_drum_pads": can_have_drum_pads,
             "chain_count": len(chain_list),
+            "drum_pad_count": len(drum_pads),
+            "drum_pads": drum_pads,
             "parameter_count": parameter_count,
             "parameters_returned": len(parameters),
             "truncated": truncated,

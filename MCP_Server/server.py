@@ -7,7 +7,7 @@ import math
 import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
@@ -260,6 +260,44 @@ def get_ableton_connection():
 
 # Core Tool endpoints
 
+# ── Track addressing ──────────────────────────────────────────────────────────
+# Every track-addressed tool takes an optional track_name alongside track_index.
+# The name wins when both are given, and the remote script resolves it once,
+# centrally, before any handler runs.
+#
+# Why: indices move. Adding a single group track to the template shifted BASS
+# from 4 to 7 and silently invalidated every map that had been hardcoded against
+# it. A name survives reordering, so prefer it — and an unknown or ambiguous
+# name is a loud error listing the real names, never a guess at which one.
+
+def _track_params(track_index: int, track_name: str,
+                  track_type: str = "track", **extra) -> Dict[str, Any]:
+    """Build command params that address a track by name when one is given.
+
+    track_index defaults to -1 ("not given") rather than 0, so a call that
+    forgets to address a track at all fails here instead of quietly operating on
+    whatever track happens to sit at index 0.
+    """
+    if not track_name and track_index < 0 and \
+            str(track_type).lower() not in ("master", "master_track"):
+        raise ValueError(
+            'No track given — pass track_name (preferred, e.g. "BASS") '
+            "or a track_index of 0 or more.")
+
+    params: Dict[str, Any] = {"track_index": track_index}
+    if track_name:
+        params["track_name"] = track_name
+    if track_type != "track":
+        params["track_type"] = track_type
+    params.update(extra)
+    return params
+
+
+def _where(track_index: int, track_name: str) -> str:
+    """How to refer to the addressed track in a result message."""
+    return f'"{track_name}"' if track_name else f"track {track_index}"
+
+
 @mcp.tool()
 def get_session_info(ctx: Context) -> str:
     """Get detailed information about the current Ableton session"""
@@ -272,16 +310,20 @@ def get_session_info(ctx: Context) -> str:
         return f"Error getting session info: {str(e)}"
 
 @mcp.tool()
-def get_track_info(ctx: Context, track_index: int) -> str:
+def get_track_info(ctx: Context, track_index: int = -1, track_name: str = "") -> str:
     """
     Get detailed information about a specific track in Ableton.
 
     Parameters:
     - track_index: The index of the track to get information about
+    - track_name: Track name, e.g. "BASS" (case-insensitive, unique partial match
+      allowed). PREFER this over track_index — it survives tracks being added,
+      removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_track_info", {"track_index": track_index})
+        result = ableton.send_command(
+            "get_track_info", _track_params(track_index, track_name))
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting track info from Ableton: {str(e)}")
@@ -372,7 +414,48 @@ def _render_session_overview(overview: Dict[str, Any]) -> str:
     lines.append("master: [{0}]".format(
         ", ".join(master.get("devices") or []) or "no devices"))
 
+    scenes = overview.get("scenes") or []
+    if scenes:
+        named = ['{0}:"{1}"'.format(s.get("index"), s.get("name"))
+                 for s in scenes if s.get("name")]
+        row = "scenes: {0}".format(len(scenes))
+        if named:
+            row += " — " + " · ".join(named)
+            unnamed = len(scenes) - len(named)
+            if unnamed:
+                row += " (+{0} unnamed)".format(unnamed)
+        else:
+            # Live shows unnamed scenes as numbers; say so rather than invent names.
+            row += " (none named)"
+        lines.append(row)
+
     return "\n".join(lines)
+
+
+def _color_hex(value) -> Optional[str]:
+    """Live stores a colour as an int; '#a3c2e8' is the readable form of it."""
+    try:
+        return "#{0:06x}".format(int(value) & 0xFFFFFF)
+    except (TypeError, ValueError):
+        return None
+
+
+def _with_color_hex(overview: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy of the overview with a readable colour beside each raw colour int.
+
+    Kept out of the track map on purpose — colour is not part of the everyday
+    answer, and the map earns its keep by being the cheapest possible read.
+    """
+    def paint(entry: Dict[str, Any]) -> Dict[str, Any]:
+        if entry.get("color") is None:
+            return entry
+        return dict(entry, color_hex=_color_hex(entry["color"]))
+
+    out = dict(overview)
+    for key in ("tracks", "return_tracks", "scenes"):
+        if overview.get(key):
+            out[key] = [paint(entry) for entry in overview[key]]
+    return out
 
 
 @mcp.tool()
@@ -388,6 +471,9 @@ def get_session_overview(ctx: Context, summary_only: bool = False) -> str:
     Returns an indented track map (group children are indented under their
     group), followed by the same data as JSON for exact values.
 
+    Also reports scene names, and each track's colour in the JSON detail
+    (as a raw int plus a readable "#rrggbb").
+
     Parameters:
     - summary_only: Set true to return only the track map and skip the JSON detail
     """
@@ -398,7 +484,8 @@ def get_session_overview(ctx: Context, summary_only: bool = False) -> str:
 
         if summary_only:
             return text
-        return "{0}\n\n{1}".format(text, json.dumps(overview, indent=2))
+        return "{0}\n\n{1}".format(
+            text, json.dumps(_with_color_hex(overview), indent=2))
     except Exception as e:
         logger.error(f"Error getting session overview: {str(e)}")
         return f"Error getting session overview: {str(e)}"
@@ -448,6 +535,39 @@ def _active_label(is_active) -> str:
     return "on" if is_active else "OFF"
 
 
+def _render_drum_pads(device: Dict[str, Any], indent: str) -> List[str]:
+    """A Drum Rack's pad map: which MIDI note plays which pad.
+
+    Knowing a rack has ten pads is useless for writing a part; knowing "Bongo"
+    answers to note 39 is the whole thing. Note names use Ableton's convention
+    (C3 = MIDI 60) so they match the clip editor.
+    """
+    pads = device.get("drum_pads") or []
+    if not pads:
+        return []
+
+    cells = []
+    for pad in pads:
+        note = pad.get("note")
+        try:
+            named = "{0} {1}".format(note, _note_name(int(note)))
+        except (TypeError, ValueError):
+            named = str(note)
+        cell = '{0} "{1}"'.format(named, pad.get("name", ""))
+        flags = [flag for flag in ("mute", "solo") if pad.get(flag)]
+        if flags:
+            cell += " <" + " ".join(flags) + ">"
+        cells.append(cell)
+
+    lines = []
+    per_line = 4
+    for start in range(0, len(cells), per_line):
+        label = "pads:" if start == 0 else "     "
+        lines.append("{0}   {1} {2}".format(
+            indent, label, " · ".join(cells[start:start + per_line])))
+    return lines
+
+
 def _render_device_block(device: Dict[str, Any], terms: List[str], indent: str) -> List[str]:
     """One device: a header line, its matching parameters, then any chains."""
     params = [p for p in (device.get("parameters") or []) if _param_matches(p, terms)]
@@ -482,6 +602,8 @@ def _render_device_block(device: Dict[str, Any], terms: List[str], indent: str) 
         for param in params:
             lines.append("{0}     {1}  {2}".format(
                 indent, str(param.get("name", "")).ljust(width), _param_display(param)))
+
+    lines.extend(_render_drum_pads(device, indent))
 
     for chain in device.get("chains") or []:
         lines.append('{0}   chain {1} "{2}"'.format(
@@ -613,7 +735,8 @@ def _filtered_payload(payload: Dict[str, Any], terms: List[str]) -> Dict[str, An
 @mcp.tool()
 def get_device_parameters(
     ctx: Context,
-    track_index: int = 0,
+    track_index: int = -1,
+    track_name: str = "",
     device_index: int = -1,
     track_type: str = "track",
     parameter_filter: str = "",
@@ -647,8 +770,14 @@ def get_device_parameters(
     device parameter and is not exposed here. Whether sidechain is enabled, and
     its gain/mix, are.
 
+    A Drum Rack also reports its pad map — which MIDI note plays which pad. That
+    is what writing a drum or percussion part needs: "Bongo" is only useful once
+    you know it answers to note 39.
+
     Parameters:
     - track_index: Index of the track (ignored when track_type is "master")
+    - track_name: Track name, e.g. "DRUMS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     - device_index: Index of one device, or -1 (default) for every device on the track
     - track_type: "track" (default), "return" for a return track, or "master"
     - parameter_filter: Only show parameters whose name contains one of these
@@ -659,12 +788,11 @@ def get_device_parameters(
     """
     try:
         ableton = get_ableton_connection()
-        payload = ableton.send_command("get_device_parameters", {
-            "track_index": track_index,
-            "device_index": device_index,
-            "track_type": track_type,
-            "include_chains": include_chains
-        })
+        payload = ableton.send_command("get_device_parameters", _track_params(
+            track_index, track_name,
+            device_index=device_index,
+            track_type=track_type,
+            include_chains=include_chains))
 
         text = _render_device_parameters(payload, parameter_filter, summary_only)
 
@@ -694,46 +822,51 @@ def create_midi_track(ctx: Context, index: int = -1) -> str:
 
 
 @mcp.tool()
-def set_track_name(ctx: Context, track_index: int, name: str) -> str:
+def set_track_name(ctx: Context, name: str, track_index: int = -1, track_name: str = "") -> str:
     """
     Set the name of a track.
 
     Parameters:
-    - track_index: The index of the track to rename
     - name: The new name for the track
+    - track_index: The index of the track to rename
+    - track_name: CURRENT name of the track to rename, e.g. "BASS". PREFER this
+      over track_index — it survives tracks being added, removed or reordered.
+      Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("set_track_name", {"track_index": track_index, "name": name})
+        result = ableton.send_command(
+            "set_track_name", _track_params(track_index, track_name, name=name))
         return f"Renamed track to: {result.get('name', name)}"
     except Exception as e:
         logger.error(f"Error setting track name: {str(e)}")
         return f"Error setting track name: {str(e)}"
 
 @mcp.tool()
-def create_clip(ctx: Context, track_index: int, clip_index: int, length: float = 4.0) -> str:
+def create_clip(ctx: Context, clip_index: int, track_index: int = -1,
+                track_name: str = "", length: float = 4.0) -> str:
     """
     Create a new MIDI clip in the specified track and clip slot.
 
     Parameters:
-    - track_index: The index of the track to create the clip in
     - clip_index: The index of the clip slot to create the clip in
+    - track_index: The index of the track to create the clip in
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     - length: The length of the clip in beats (default: 4.0)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("create_clip", {
-            "track_index": track_index, 
-            "clip_index": clip_index, 
-            "length": length
-        })
-        return f"Created new clip at track {track_index}, slot {clip_index} with length {length} beats"
+        result = ableton.send_command("create_clip", _track_params(
+            track_index, track_name, clip_index=clip_index, length=length))
+        return f"Created new clip at {_where(track_index, track_name)}, slot {clip_index} with length {length} beats"
     except Exception as e:
         logger.error(f"Error creating clip: {str(e)}")
         return f"Error creating clip: {str(e)}"
 
 @mcp.tool()
-def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str) -> str:
+def create_audio_clip(ctx: Context, clip_index: int, path: str,
+                      track_index: int = -1, track_name: str = "") -> str:
     """
     Create a new audio clip in an audio track's clip slot by importing a file.
 
@@ -742,19 +875,18 @@ def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str
     available in earlier 12.0.x releases.
 
     Parameters:
-    - track_index: The index of the audio track to create the clip in
     - clip_index: The index of the clip slot to create the clip in
     - path: Absolute path to a supported audio file (e.g. a .wav). The target
       track must be an audio track and the clip slot must be empty.
+    - track_index: The index of the audio track to create the clip in
+    - track_name: Track name, e.g. "PERC-LOOP". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("create_audio_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index,
-            "path": path
-        })
-        return f"Created audio clip '{result.get('name', 'clip')}' at track {track_index}, slot {clip_index} (length {result.get('length', '?')} beats)"
+        result = ableton.send_command("create_audio_clip", _track_params(
+            track_index, track_name, clip_index=clip_index, path=path))
+        return f"Created audio clip '{result.get('name', 'clip')}' at {_where(track_index, track_name)}, slot {clip_index} (length {result.get('length', '?')} beats)"
     except Exception as e:
         logger.error(f"Error creating audio clip: {str(e)}")
         return f"Error creating audio clip: {str(e)}"
@@ -762,26 +894,27 @@ def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str
 @mcp.tool()
 def add_notes_to_clip(
     ctx: Context,
-    track_index: int,
     clip_index: int,
-    notes: List[Dict[str, Union[int, float, bool]]]
+    notes: List[Dict[str, Union[int, float, bool]]],
+    track_index: int = -1,
+    track_name: str = ""
 ) -> str:
     """
     Add MIDI notes to a clip.
 
     Parameters:
-    - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
     - notes: List of note dictionaries, each with pitch, start_time, duration, velocity, and mute
+    - track_index: The index of the track containing the clip
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered, and writing to the wrong
+      index is the classic failure here. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("add_notes_to_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index,
-            "notes": notes
-        })
-        return f"Added {len(notes)} notes to clip at track {track_index}, slot {clip_index}"
+        result = ableton.send_command("add_notes_to_clip", _track_params(
+            track_index, track_name, clip_index=clip_index, notes=notes))
+        return f"Added {len(notes)} notes to clip at {_where(track_index, track_name)}, slot {clip_index}"
     except Exception as e:
         logger.error(f"Error adding notes to clip: {str(e)}")
         return f"Error adding notes to clip: {str(e)}"
@@ -979,8 +1112,9 @@ def _summarize_notes(clip_info: Dict[str, Any]) -> Dict[str, Any]:
 @mcp.tool()
 def get_clip_notes(
     ctx: Context,
-    track_index: int,
     clip_index: int,
+    track_index: int = -1,
+    track_name: str = "",
     summary_only: bool = False
 ) -> str:
     """
@@ -999,16 +1133,16 @@ def get_clip_notes(
     match what's shown in Live's clip editor.
 
     Parameters:
-    - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
+    - track_index: The index of the track containing the clip
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     - summary_only: Set true to skip the raw note list and return only the digest
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_clip_notes", {
-            "track_index": track_index,
-            "clip_index": clip_index
-        })
+        result = ableton.send_command("get_clip_notes", _track_params(
+            track_index, track_name, clip_index=clip_index))
 
         summary = _summarize_notes(result)
         notes = result.pop("notes", [])
@@ -1023,23 +1157,23 @@ def get_clip_notes(
         return f"Error getting clip notes: {str(e)}"
 
 @mcp.tool()
-def set_clip_name(ctx: Context, track_index: int, clip_index: int, name: str) -> str:
+def set_clip_name(ctx: Context, clip_index: int, name: str,
+                  track_index: int = -1, track_name: str = "") -> str:
     """
     Set the name of a clip.
 
     Parameters:
-    - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
     - name: The new name for the clip
+    - track_index: The index of the track containing the clip
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("set_clip_name", {
-            "track_index": track_index,
-            "clip_index": clip_index,
-            "name": name
-        })
-        return f"Renamed clip at track {track_index}, slot {clip_index} to '{name}'"
+        result = ableton.send_command("set_clip_name", _track_params(
+            track_index, track_name, clip_index=clip_index, name=name))
+        return f"Renamed clip at {_where(track_index, track_name)}, slot {clip_index} to '{name}'"
     except Exception as e:
         logger.error(f"Error setting clip name: {str(e)}")
         return f"Error setting clip name: {str(e)}"
@@ -1062,29 +1196,31 @@ def set_tempo(ctx: Context, tempo: float) -> str:
 
 
 @mcp.tool()
-def load_instrument_or_effect(ctx: Context, track_index: int, uri: str) -> str:
+def load_instrument_or_effect(ctx: Context, uri: str, track_index: int = -1,
+                              track_name: str = "") -> str:
     """
     Load an instrument or effect onto a track using its URI.
 
     Parameters:
-    - track_index: The index of the track to load the instrument on
     - uri: The URI of the instrument or effect to load (e.g., 'query:Synths#Instrument%20Rack:Bass:FileId_5116')
+    - track_index: The index of the track to load the instrument on
+    - track_name: Track name, e.g. "LEAD". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("load_browser_item", {
-            "track_index": track_index,
-            "item_uri": uri
-        })
-        
+        result = ableton.send_command("load_browser_item", _track_params(
+            track_index, track_name, item_uri=uri))
+
+        where = _where(track_index, track_name)
         # Check if the instrument was loaded successfully
         if result.get("loaded", False):
             new_devices = result.get("new_devices", [])
             if new_devices:
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. New devices: {', '.join(new_devices)}"
+                return f"Loaded instrument with URI '{uri}' on {where}. New devices: {', '.join(new_devices)}"
             else:
                 devices = result.get("devices_after", [])
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. Devices on track: {', '.join(devices)}"
+                return f"Loaded instrument with URI '{uri}' on {where}. Devices on track: {', '.join(devices)}"
         else:
             return f"Failed to load instrument with URI '{uri}'"
     except Exception as e:
@@ -1092,41 +1228,43 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str) -> str:
         return f"Error loading instrument by URI: {str(e)}"
 
 @mcp.tool()
-def fire_clip(ctx: Context, track_index: int, clip_index: int) -> str:
+def fire_clip(ctx: Context, clip_index: int, track_index: int = -1,
+              track_name: str = "") -> str:
     """
     Start playing a clip.
 
     Parameters:
-    - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
+    - track_index: The index of the track containing the clip
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("fire_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index
-        })
-        return f"Started playing clip at track {track_index}, slot {clip_index}"
+        result = ableton.send_command("fire_clip", _track_params(
+            track_index, track_name, clip_index=clip_index))
+        return f"Started playing clip at {_where(track_index, track_name)}, slot {clip_index}"
     except Exception as e:
         logger.error(f"Error firing clip: {str(e)}")
         return f"Error firing clip: {str(e)}"
 
 @mcp.tool()
-def stop_clip(ctx: Context, track_index: int, clip_index: int) -> str:
+def stop_clip(ctx: Context, clip_index: int, track_index: int = -1,
+              track_name: str = "") -> str:
     """
     Stop playing a clip.
 
     Parameters:
-    - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
+    - track_index: The index of the track containing the clip
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("stop_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index
-        })
-        return f"Stopped clip at track {track_index}, slot {clip_index}"
+        result = ableton.send_command("stop_clip", _track_params(
+            track_index, track_name, clip_index=clip_index))
+        return f"Stopped clip at {_where(track_index, track_name)}, slot {clip_index}"
     except Exception as e:
         logger.error(f"Error stopping clip: {str(e)}")
         return f"Error stopping clip: {str(e)}"
@@ -1258,24 +1396,25 @@ def get_browser_items_at_path(ctx: Context, path: str) -> str:
             return f"Error getting browser items at path: {error_msg}"
 
 @mcp.tool()
-def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) -> str:
+def load_drum_kit(ctx: Context, rack_uri: str, kit_path: str,
+                  track_index: int = -1, track_name: str = "") -> str:
     """
     Load a drum rack and then load a specific drum kit into it.
 
     Parameters:
-    - track_index: The index of the track to load on
     - rack_uri: The URI of the drum rack to load (e.g., 'Drums/Drum Rack')
     - kit_path: Path to the drum kit inside the browser (e.g., 'drums/acoustic/kit1')
+    - track_index: The index of the track to load on
+    - track_name: Track name, e.g. "DRUMS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        
+
         # Step 1: Load the drum rack
-        result = ableton.send_command("load_browser_item", {
-            "track_index": track_index,
-            "item_uri": rack_uri
-        })
-        
+        result = ableton.send_command("load_browser_item", _track_params(
+            track_index, track_name, item_uri=rack_uri))
+
         if not result.get("loaded", False):
             return f"Failed to load drum rack with URI '{rack_uri}'"
         
@@ -1296,12 +1435,10 @@ def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) 
         
         # Step 4: Load the first loadable kit
         kit_uri = loadable_kits[0].get("uri")
-        load_result = ableton.send_command("load_browser_item", {
-            "track_index": track_index,
-            "item_uri": kit_uri
-        })
-        
-        return f"Loaded drum rack and kit '{loadable_kits[0].get('name')}' on track {track_index}"
+        load_result = ableton.send_command("load_browser_item", _track_params(
+            track_index, track_name, item_uri=kit_uri))
+
+        return f"Loaded drum rack and kit '{loadable_kits[0].get('name')}' on {_where(track_index, track_name)}"
     except Exception as e:
         logger.error(f"Error loading drum kit: {str(e)}")
         return f"Error loading drum kit: {str(e)}"
@@ -1338,7 +1475,7 @@ def set_arrangement_time(ctx: Context, time: float) -> str:
 
 
 @mcp.tool()
-def get_arrangement_clips(ctx: Context, track_index: int) -> str:
+def get_arrangement_clips(ctx: Context, track_index: int = -1, track_name: str = "") -> str:
     """
     List all clips placed in the Arrangement timeline for a track.
 
@@ -1346,10 +1483,13 @@ def get_arrangement_clips(ctx: Context, track_index: int) -> str:
 
     Parameters:
     - track_index: The index of the track to inspect
+    - track_name: Track name, e.g. "BASS". PREFER this over track_index — it
+      survives tracks being added, removed or reordered. Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_arrangement_clips", {"track_index": track_index})
+        result = ableton.send_command(
+            "get_arrangement_clips", _track_params(track_index, track_name))
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting arrangement clips: {str(e)}")
@@ -1359,9 +1499,10 @@ def get_arrangement_clips(ctx: Context, track_index: int) -> str:
 @mcp.tool()
 def duplicate_to_arrangement(
     ctx: Context,
-    track_index: int,
     clip_index: int,
-    destination_time: float
+    destination_time: float,
+    track_index: int = -1,
+    track_name: str = ""
 ) -> str:
     """
     Copy a Session-view clip into the Arrangement timeline.
@@ -1376,26 +1517,26 @@ def duplicate_to_arrangement(
       3. Call switch_to_arrangement_view to confirm the result in Live
 
     Parameters:
-    - track_index:       Index of the track that owns the Session clip
     - clip_index:        Index of the clip slot in that track (Session view)
     - destination_time:  Beat position in the arrangement to place the clip
                          (e.g. 0.0 = start, 8.0 = bar 3 in 4/4)
+    - track_index:       Index of the track that owns the Session clip
+    - track_name:        Track name, e.g. "BASS". PREFER this over track_index —
+                         it survives tracks being added, removed or reordered.
+                         Wins when both are given.
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command(
             "duplicate_session_clip_to_arrangement",
-            {
-                "track_index": track_index,
-                "clip_index": clip_index,
-                "destination_time": destination_time
-            }
+            _track_params(track_index, track_name, clip_index=clip_index,
+                          destination_time=destination_time)
         )
         clip_name = result.get("clip_name", "clip")
-        track_name = result.get("track_name", f"track {track_index}")
+        on_track = result.get("track_name") or _where(track_index, track_name)
         return (
             f"Duplicated '{clip_name}' from Session slot {clip_index} "
-            f"on '{track_name}' to arrangement at beat {destination_time}"
+            f"on '{on_track}' to arrangement at beat {destination_time}"
         )
     except Exception as e:
         logger.error(f"Error duplicating clip to arrangement: {str(e)}")
