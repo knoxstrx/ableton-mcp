@@ -403,6 +403,279 @@ def get_session_overview(ctx: Context, summary_only: bool = False) -> str:
         logger.error(f"Error getting session overview: {str(e)}")
         return f"Error getting session overview: {str(e)}"
 
+# ── Device parameter rendering ────────────────────────────────────────────────
+# get_session_overview says which devices are on a track; get_device_parameters
+# says what they're set to. Live's display strings ("120 Hz", "-6.0 dB", "Soft")
+# are the useful form — a raw 0.0-1.0 value means nothing for a non-linear knob —
+# so the map below leads with those and leaves the numbers to the JSON.
+# Pure functions; no Live involved.
+
+_PARAM_NAME_WIDTH = 26
+
+
+def _filter_terms(parameter_filter: str) -> List[str]:
+    """'sidechain, threshold' -> ['sidechain', 'threshold'] (OR, case-insensitive)."""
+    if not parameter_filter:
+        return []
+    return [term.strip().lower() for term in parameter_filter.split(",") if term.strip()]
+
+
+def _param_matches(param: Dict[str, Any], terms: List[str]) -> bool:
+    """No filter matches everything; otherwise any term substring-matching the name."""
+    if not terms:
+        return True
+    name = str(param.get("name", "")).lower()
+    original = str(param.get("original_name", "")).lower()
+    return any(term in name or term in original for term in terms)
+
+
+def _param_display(param: Dict[str, Any]) -> str:
+    """Live's own display string, falling back to the raw value.
+
+    A plugin parameter that doesn't implement str_for_value comes back with
+    display_value None — showing the number beats showing nothing.
+    """
+    display = param.get("display_value")
+    if display is None or display == "":
+        return _fmt_num(param.get("value", 0))
+    return str(display)
+
+
+def _active_label(is_active) -> str:
+    """OFF is shouted because a bypassed device is the thing you need to notice."""
+    if is_active is None:
+        return "on?"
+    return "on" if is_active else "OFF"
+
+
+def _render_device_block(device: Dict[str, Any], terms: List[str], indent: str) -> List[str]:
+    """One device: a header line, its matching parameters, then any chains."""
+    params = [p for p in (device.get("parameters") or []) if _param_matches(p, terms)]
+    total = device.get("parameter_count", len(device.get("parameters") or []))
+
+    # The remote script's device-type heuristic is upstream's and only really
+    # fires for racks — every stock effect comes back "unknown". Printing that
+    # on every line is noise pretending to be information, so drop it.
+    kind = device.get("type")
+    kind_part = "" if kind in (None, "", "unknown") else " · {0}".format(kind)
+
+    header = "{0}[{1}] {2}{3} · {4} · {5} params".format(
+        indent,
+        device.get("index"),
+        device.get("name", ""),
+        kind_part,
+        _active_label(device.get("is_active")),
+        total)
+    if terms:
+        header += " ({0} match)".format(len(params))
+    if device.get("chain_count"):
+        header += " · {0} chains".format(device["chain_count"])
+        if "chains" not in device:
+            header += " (not expanded)"
+    if device.get("truncated"):
+        header += " · TRUNCATED to {0}".format(device.get("parameters_returned"))
+
+    lines = [header]
+
+    if params:
+        width = min(max(len(str(p.get("name", ""))) for p in params), _PARAM_NAME_WIDTH)
+        for param in params:
+            lines.append("{0}     {1}  {2}".format(
+                indent, str(param.get("name", "")).ljust(width), _param_display(param)))
+
+    for chain in device.get("chains") or []:
+        lines.append('{0}   chain {1} "{2}"'.format(
+            indent, chain.get("index"), chain.get("name", "")))
+        for nested in chain.get("devices") or []:
+            lines.extend(_render_device_block(nested, terms, indent + "     "))
+
+    return lines
+
+
+def _mixer_params(mixer: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fader/pan and the sends as one flat list, in strip order."""
+    if not mixer:
+        return []
+    return list(mixer.get("parameters") or []) + list(mixer.get("sends") or [])
+
+
+def _render_mixer_block(mixer: Dict[str, Any], terms: List[str]) -> List[str]:
+    """The mixer strip, rendered like a device so it reads as part of the chain."""
+    params = [p for p in _mixer_params(mixer) if _param_matches(p, terms)]
+
+    header = "[mixer] fader/pan · {0} sends".format(mixer.get("send_count", 0))
+    if terms:
+        header += " ({0} match)".format(len(params))
+
+    lines = [header]
+    if params:
+        width = min(max(len(str(p.get("name", ""))) for p in params), _PARAM_NAME_WIDTH)
+        for param in params:
+            lines.append("     {0}  {1}".format(
+                str(param.get("name", "")).ljust(width), _param_display(param)))
+    return lines
+
+
+def _render_device_parameters(payload: Dict[str, Any],
+                              parameter_filter: str = "",
+                              summary_only: bool = False) -> str:
+    """Render a get_device_parameters payload as a readable settings map."""
+    devices = payload.get("devices") or []
+    mixer = payload.get("mixer") or None
+    terms = _filter_terms(parameter_filter)
+
+    kind = payload.get("track_type", "track")
+    index = payload.get("track_index")
+    where = kind if index is None else "{0} {1}".format(kind, index)
+    head = '"{0}" · {1} · {2} devices'.format(
+        payload.get("track_name", ""), where, payload.get("device_count", len(devices)))
+    if payload.get("devices_returned") is not None and \
+            payload.get("devices_returned") != payload.get("device_count"):
+        head += " ({0} shown)".format(payload["devices_returned"])
+
+    if terms:
+        pools = [d.get("parameters") or [] for d in devices] + [_mixer_params(mixer)]
+        matched = sum(1 for pool in pools for p in pool if _param_matches(p, terms))
+        seen = sum(len(pool) for pool in pools)
+        head += ' · filter "{0}" — {1} of {2} parameters match'.format(
+            parameter_filter, matched, seen)
+
+    lines = [head]
+
+    if summary_only:
+        if mixer:
+            lines.extend(_render_mixer_block(mixer, terms)[:1])
+        for device in devices:
+            lines.extend(_render_device_block(device, terms, "")[:1])
+        if not devices:
+            lines.append("(no devices)")
+        return "\n".join(lines)
+
+    silent = []
+
+    if mixer:
+        if not terms or any(_param_matches(p, terms) for p in _mixer_params(mixer)):
+            lines.extend(_render_mixer_block(mixer, terms))
+        else:
+            silent.append("mixer")
+
+    if not devices:
+        if silent:
+            lines.append("(no match on: {0})".format(", ".join(silent)))
+        lines.append("(no devices)")
+        return "\n".join(lines)
+
+    for device in devices:
+        # With a filter on, a device with no hits is noise — but say it was
+        # looked at, so "no match" never reads as "device not present".
+        if terms and not any(_param_matches(p, terms)
+                             for p in (device.get("parameters") or [])):
+            silent.append("{0} {1}".format(device.get("index"), device.get("name", "")))
+            continue
+        lines.extend(_render_device_block(device, terms, ""))
+
+    if silent:
+        lines.append("(no match on: {0})".format(", ".join(silent)))
+
+    return "\n".join(lines)
+
+
+def _filtered_payload(payload: Dict[str, Any], terms: List[str]) -> Dict[str, Any]:
+    """Copy of the payload with non-matching parameters dropped from the JSON.
+
+    Without this the filter would shrink the map but not the response, which is
+    the opposite of what someone asking for one knob wants.
+    """
+    if not terms:
+        return payload
+
+    def prune(device: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(device)
+        out["parameters"] = [p for p in (device.get("parameters") or [])
+                             if _param_matches(p, terms)]
+        out["parameters_matched"] = len(out["parameters"])
+        if device.get("chains"):
+            out["chains"] = [dict(c, devices=[prune(d) for d in (c.get("devices") or [])])
+                             for c in device["chains"]]
+        return out
+
+    out = dict(payload, devices=[prune(d) for d in (payload.get("devices") or [])])
+    mixer = payload.get("mixer")
+    if mixer:
+        out["mixer"] = dict(
+            mixer,
+            parameters=[p for p in (mixer.get("parameters") or [])
+                        if _param_matches(p, terms)],
+            sends=[p for p in (mixer.get("sends") or []) if _param_matches(p, terms)])
+    return out
+
+
+@mcp.tool()
+def get_device_parameters(
+    ctx: Context,
+    track_index: int = 0,
+    device_index: int = -1,
+    track_type: str = "track",
+    parameter_filter: str = "",
+    summary_only: bool = False,
+    include_chains: bool = False
+) -> str:
+    """
+    Read what a track's devices are actually SET TO — every knob, with the value
+    string Live shows on screen ("120 Hz", "-6.0 dB", "Soft", "On").
+
+    get_session_overview tells you a track has an EQ Eight; this tells you where
+    its high-pass sits. Use it to check a mix, verify a template against a spec,
+    or answer "what's the release on the bass compressor" without guessing.
+
+    Also reports each device's on/off state (is_active — false both when the
+    device is bypassed and when it sits in a deactivated rack chain).
+
+    Reading a whole track (the default) also returns the mixer strip — fader,
+    pan and every send, in dB. Those live outside the device chain, so asking
+    for one specific device does not include them.
+
+    Returns a settings map, then the same data as JSON for exact values
+    (each parameter carries value, min, max and is_quantized alongside the
+    display string, so a raw number can be interpreted).
+
+    Rack and Drum Rack chains are NOT expanded unless include_chains is set —
+    a Drum Rack with sixteen loaded pads would otherwise bury the track's own
+    devices. The chain count is always shown so you know there's more inside.
+
+    Known limit: a Compressor's sidechain SOURCE (which track feeds it) is not a
+    device parameter and is not exposed here. Whether sidechain is enabled, and
+    its gain/mix, are.
+
+    Parameters:
+    - track_index: Index of the track (ignored when track_type is "master")
+    - device_index: Index of one device, or -1 (default) for every device on the track
+    - track_type: "track" (default), "return" for a return track, or "master"
+    - parameter_filter: Only show parameters whose name contains one of these
+      comma-separated terms, e.g. "threshold, ratio, attack". Case-insensitive.
+    - summary_only: Set true to list the devices with their on/off state and
+      parameter counts, without any parameter values
+    - include_chains: Set true to also read the devices inside rack chains
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload = ableton.send_command("get_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "track_type": track_type,
+            "include_chains": include_chains
+        })
+
+        text = _render_device_parameters(payload, parameter_filter, summary_only)
+
+        if summary_only:
+            return text
+        detail = _filtered_payload(payload, _filter_terms(parameter_filter))
+        return "{0}\n\n{1}".format(text, json.dumps(detail, indent=2))
+    except Exception as e:
+        logger.error(f"Error getting device parameters: {str(e)}")
+        return f"Error getting device parameters: {str(e)}"
+
 @mcp.tool()
 def create_midi_track(ctx: Context, index: int = -1) -> str:
     """

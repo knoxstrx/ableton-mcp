@@ -21,6 +21,16 @@ DEFAULT_PORT = 9877
 # so there is no reason to expose this control socket to the LAN.
 HOST = "127.0.0.1"
 
+# Payload guard for get_device_parameters. A VST like Vital exposes several
+# hundred parameters and a whole-track read multiplies that by the device
+# count. This is NOT a display limit — the server does its own filtering and
+# formatting — it only stops one pathological plugin from producing a
+# multi-megabyte socket frame. Truncation is always reported back
+# (parameter_count vs parameters_returned, plus a truncated flag).
+MAX_PARAMETERS_PER_DEVICE = 512
+# How deep to follow rack/drum-rack chains when include_chains is requested.
+MAX_CHAIN_DEPTH = 2
+
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
     return AbletonMCP(c_instance)
@@ -366,6 +376,13 @@ class AbletonMCP(ControlSurface):
             # Read-only whole-session read – no main-thread scheduling required
             elif command_type == "get_session_overview":
                 response["result"] = self._get_session_overview()
+            # Read-only device/parameter read – no main-thread scheduling required
+            elif command_type == "get_device_parameters":
+                response["result"] = self._get_device_parameters(
+                    params.get("track_index", 0),
+                    params.get("device_index", -1),
+                    params.get("track_type", "track"),
+                    bool(params.get("include_chains", False)))
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -568,6 +585,237 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting session overview: " + str(e))
+            raise
+
+    # ── Device parameters ────────────────────────────────────────────────────
+    # get_session_overview answers "what devices are on this track"; these
+    # answer "and what are they set to". Deliberately thin: raw values plus the
+    # display strings Live itself would show, no interpretation. All filtering,
+    # formatting and comparison happens server-side, because server.py reloads
+    # with an LM Studio restart while this file costs a full Live restart.
+
+    def _safe_float(self, obj, attr, default):
+        """Read obj.<attr> as a float, or default if it's missing/not numeric."""
+        try:
+            return float(getattr(obj, attr))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return default
+
+    def _resolve_track(self, track_index, track_type):
+        """Address a regular track, a return track or the master.
+
+        Returns (track, kind, index, name). The audit this was built for has to
+        reach returns and the master, and Live keeps those in three separate
+        collections, so the caller has to say which one it means.
+        """
+        kind = str(track_type or "track").lower()
+
+        if kind in ("master", "master_track"):
+            master = self._song.master_track
+            return master, "master", None, master.name
+
+        if kind in ("return", "return_track", "returns"):
+            returns = list(self._song.return_tracks)
+            if track_index < 0 or track_index >= len(returns):
+                raise IndexError(
+                    "Return track index {0} out of range — the set has {1} return track(s)".format(
+                        track_index, len(returns)))
+            return returns[track_index], "return", track_index, returns[track_index].name
+
+        if kind in ("track", "tracks", "regular", ""):
+            tracks = list(self._song.tracks)
+            if track_index < 0 or track_index >= len(tracks):
+                raise IndexError(
+                    "Track index {0} out of range — the set has {1} track(s)".format(
+                        track_index, len(tracks)))
+            return tracks[track_index], "track", track_index, tracks[track_index].name
+
+        raise ValueError(
+            "Unknown track_type '{0}' — use 'track', 'return' or 'master'".format(track_type))
+
+    def _read_parameter(self, param, index):
+        """One DeviceParameter as plain data.
+
+        display_value comes from str_for_value(value), which is what Live shows
+        on screen ("120 Hz", "-6.0 dB", "Soft") — the raw value alone is
+        meaningless for anything non-linear. value is kept alongside it for
+        machine comparison, and min/max/is_quantized say what that value means.
+        """
+        value = self._safe_float(param, "value", 0.0)
+
+        display = None
+        try:
+            display = str(param.str_for_value(param.value))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            # Some plugin parameters don't implement it; the numeric value and
+            # the range still tell the caller something.
+            display = None
+
+        return {
+            "index": index,
+            "name": str(self._safe_attr(param, "name", "")),
+            "original_name": str(self._safe_attr(param, "original_name", "")),
+            # round() kills float noise like 0.30000000000000004
+            "value": round(value, 6),
+            "display_value": display,
+            "min": round(self._safe_float(param, "min", 0.0), 6),
+            "max": round(self._safe_float(param, "max", 0.0), 6),
+            "is_quantized": bool(self._safe_attr(param, "is_quantized", False))
+        }
+
+    def _read_mixer(self, track):
+        """The mixer strip: fader, pan and sends.
+
+        These are DeviceParameters like any other, but they hang off
+        track.mixer_device instead of track.devices — so a devices-only read
+        silently misses the two things a mix audit asks first: how loud is this
+        track, and how much of it is going to the reverb.
+        """
+        mixer = self._safe_attr(track, "mixer_device", None)
+        if mixer is None:
+            return None
+
+        entries = []
+        for index, attr in enumerate(("volume", "panning")):
+            param = self._safe_attr(mixer, attr, None)
+            if param is not None:
+                entries.append(self._read_parameter(param, index))
+
+        try:
+            send_list = list(mixer.sends)
+        except (AttributeError, TypeError, RuntimeError):
+            # Master has no sends; a return track only has sends to returns
+            # after it. Both are normal, not errors.
+            send_list = []
+
+        sends = []
+        for index, send in enumerate(send_list):
+            entry = self._read_parameter(send, index)
+            entry["return_index"] = index
+            sends.append(entry)
+
+        return {
+            "parameters": entries,
+            "send_count": len(sends),
+            "sends": sends
+        }
+
+    def _read_device(self, device, index, include_chains, depth):
+        """One device: its identity, on/off state, and its parameters."""
+        try:
+            all_params = list(device.parameters)
+        except (AttributeError, TypeError, RuntimeError):
+            all_params = []
+
+        parameter_count = len(all_params)
+        truncated = parameter_count > MAX_PARAMETERS_PER_DEVICE
+        if truncated:
+            all_params = all_params[:MAX_PARAMETERS_PER_DEVICE]
+
+        parameters = [self._read_parameter(param, p_index)
+                      for p_index, param in enumerate(all_params)]
+
+        # Device.is_active is the honest answer — it's False both when the
+        # device is switched off AND when it sits in a deactivated rack chain.
+        # Where it isn't exposed, fall back to the standard 'Device On' switch,
+        # which every stock device carries as its first parameter.
+        is_active = self._safe_attr(device, "is_active", None)
+        if is_active is None:
+            for param in parameters:
+                if param["name"] == "Device On":
+                    is_active = param["value"] > 0.5
+                    break
+
+        can_have_chains = bool(self._safe_attr(device, "can_have_chains", False))
+        chain_list = []
+        if can_have_chains:
+            try:
+                chain_list = list(device.chains)
+            except (AttributeError, TypeError, RuntimeError):
+                chain_list = []
+
+        info = {
+            "index": index,
+            "name": str(self._safe_attr(device, "name", "")),
+            "class_name": str(self._safe_attr(device, "class_name", "")),
+            "type": self._get_device_type(device),
+            "is_active": None if is_active is None else bool(is_active),
+            "can_have_chains": can_have_chains,
+            "can_have_drum_pads": bool(self._safe_attr(device, "can_have_drum_pads", False)),
+            "chain_count": len(chain_list),
+            "parameter_count": parameter_count,
+            "parameters_returned": len(parameters),
+            "truncated": truncated,
+            "parameters": parameters
+        }
+
+        if chain_list and include_chains:
+            if depth < MAX_CHAIN_DEPTH:
+                chains = []
+                for chain_index, chain in enumerate(chain_list):
+                    try:
+                        chain_devices = list(chain.devices)
+                    except (AttributeError, TypeError, RuntimeError):
+                        chain_devices = []
+                    chains.append({
+                        "index": chain_index,
+                        "name": str(self._safe_attr(chain, "name", "")),
+                        "devices": [self._read_device(d, d_index, include_chains, depth + 1)
+                                    for d_index, d in enumerate(chain_devices)]
+                    })
+                info["chains"] = chains
+            else:
+                # Say so rather than silently returning a rack as a leaf.
+                info["chains_omitted"] = "depth limit ({0})".format(MAX_CHAIN_DEPTH)
+
+        return info
+
+    def _get_device_parameters(self, track_index, device_index, track_type, include_chains):
+        """Read device settings off a track, a return track or the master.
+
+        device_index < 0 reads EVERY device on the track in one call — the same
+        N-round-trips problem get_session_overview was built to kill, applied to
+        an audit that has to walk a whole set.
+
+        Rack chains are NOT expanded unless include_chains is set: a Drum Rack
+        with sixteen loaded pads would otherwise bury the track's own devices.
+        chain_count is always reported so the caller knows there's more inside.
+
+        A whole-track read also carries the mixer strip (fader, pan, sends).
+        Asking for one device doesn't — the mixer isn't part of that answer.
+        """
+        try:
+            track, kind, resolved_index, track_name = self._resolve_track(
+                track_index, track_type)
+
+            device_list = list(track.devices)
+            whole_track = device_index is None or device_index < 0
+
+            if whole_track:
+                selected = list(enumerate(device_list))
+            else:
+                if device_index >= len(device_list):
+                    raise IndexError(
+                        "Device index {0} out of range — {1} '{2}' has {3} device(s)".format(
+                            device_index, kind, track_name, len(device_list)))
+                selected = [(device_index, device_list[device_index])]
+
+            devices = [self._read_device(device, index, include_chains, 0)
+                       for index, device in selected]
+
+            result = {
+                "track_type": kind,
+                "track_index": resolved_index,
+                "track_name": track_name,
+                "device_count": len(device_list),
+                "devices_returned": len(devices),
+                "devices": devices
+            }
+            if whole_track:
+                result["mixer"] = self._read_mixer(track)
+            return result
+        except Exception as e:
+            self.log_message("Error getting device parameters: " + str(e))
             raise
 
     def _create_midi_track(self, index):
