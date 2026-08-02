@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -57,9 +58,31 @@ CLEAN_SUB_SECONDS = {
 }
 CLEAN_SUB_OSC_1_AUDIBLE_LEVEL = 0.662851
 
+BASIC_SHAPES_SINE = 0.0
+BASIC_SHAPES_SATURATED_SINE = 42.0
+BASIC_SHAPES_TRIANGLE = 85.0
+BASIC_SHAPES_SQUARE = 128.0
+BASIC_SHAPES_SAW = 214.0
+
 
 class PresetError(ValueError):
     """Raised when a preset cannot be transformed safely."""
+
+
+@dataclass(frozen=True)
+class ModulationSpec:
+    source: str
+    destination: str
+    amount: float
+
+
+@dataclass(frozen=True)
+class PresetRecipe:
+    slug: str
+    preset_name: str
+    comments: str
+    settings: dict[str, float]
+    modulations: tuple[ModulationSpec, ...] = ()
 
 
 def sha256_path(path: Path) -> str:
@@ -103,6 +126,27 @@ def quartic_control_for_seconds(seconds: float) -> float:
     if seconds < 0:
         raise PresetError("Envelope time cannot be negative")
     return math.sqrt(math.sqrt(seconds))
+
+
+def exponential_control_for_seconds(seconds: float) -> float:
+    """Convert displayed seconds to Vital's stored base-2 exponential value."""
+    if seconds <= 0:
+        raise PresetError("Exponential time must be greater than zero")
+    return math.log2(seconds)
+
+
+def level_control_for_audible_level(level: float) -> float:
+    """Convert a 0..1 audible level to Vital's stored quadratic control."""
+    if not 0.0 <= level <= 1.0:
+        raise PresetError("Audible oscillator level must be between zero and one")
+    return math.sqrt(level)
+
+
+def cutoff_control_for_hz(frequency_hz: float) -> float:
+    """Convert Hz to Vital's MIDI-note-style filter cutoff control."""
+    if frequency_hz <= 0:
+        raise PresetError("Filter cutoff frequency must be greater than zero")
+    return 69.0 + 12.0 * math.log2(frequency_hz / 440.0)
 
 
 def _require_setting_keys(settings: dict[str, Any], names: Iterable[str]) -> None:
@@ -175,6 +219,220 @@ def clean_sub_setting_updates(source_settings: dict[str, Any]) -> dict[str, floa
     return updates
 
 
+def _oscillator_updates(
+    oscillator: int,
+    *,
+    wave_frame: float,
+    audible_level: float,
+    transpose: float = 0.0,
+    tune: float = 0.0,
+    pan: float = 0.0,
+) -> dict[str, float]:
+    prefix = f"osc_{oscillator}"
+    return {
+        f"{prefix}_on": 1.0,
+        f"{prefix}_level": level_control_for_audible_level(audible_level),
+        f"{prefix}_pan": pan,
+        f"{prefix}_destination": 0.0,
+        f"{prefix}_transpose": transpose,
+        f"{prefix}_tune": tune,
+        f"{prefix}_unison_voices": 1.0,
+        f"{prefix}_phase": 0.5,
+        f"{prefix}_random_phase": 0.0,
+        f"{prefix}_wave_frame": wave_frame,
+        f"{prefix}_distortion_type": 0.0,
+        f"{prefix}_spectral_morph_type": 0.0,
+    }
+
+
+def _envelope_updates(
+    envelope: int,
+    *,
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+) -> dict[str, float]:
+    prefix = f"env_{envelope}"
+    return {
+        f"{prefix}_delay": 0.0,
+        f"{prefix}_attack": quartic_control_for_seconds(attack),
+        f"{prefix}_hold": 0.0,
+        f"{prefix}_decay": quartic_control_for_seconds(decay),
+        f"{prefix}_sustain": sustain,
+        f"{prefix}_release": quartic_control_for_seconds(release),
+        f"{prefix}_attack_power": 0.0,
+        f"{prefix}_decay_power": -2.0,
+        f"{prefix}_release_power": -2.0,
+    }
+
+
+def _filter_updates(
+    *,
+    model: float,
+    style: float,
+    cutoff_hz: float,
+    resonance: float,
+    drive_db: float,
+    keytrack: float = 0.0,
+) -> dict[str, float]:
+    return {
+        "filter_1_on": 1.0,
+        "filter_1_model": model,
+        "filter_1_style": style,
+        "filter_1_cutoff": cutoff_control_for_hz(cutoff_hz),
+        "filter_1_resonance": resonance,
+        "filter_1_drive": drive_db,
+        "filter_1_mix": 1.0,
+        "filter_1_keytrack": keytrack,
+        "filter_1_blend": 0.0,
+    }
+
+
+ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
+    "short-pluck": PresetRecipe(
+        slug="short-pluck",
+        preset_name="KDB Bass 03 - Short Pluck",
+        comments="Short saw-and-sine bass pluck with a fast low-pass filter envelope.",
+        settings={
+            **_oscillator_updates(1, wave_frame=BASIC_SHAPES_SAW, audible_level=0.42),
+            **_oscillator_updates(2, wave_frame=BASIC_SHAPES_SINE, audible_level=0.16),
+            **_filter_updates(
+                model=0.0, style=1.0, cutoff_hz=115.0, resonance=0.18, drive_db=3.0
+            ),
+            **_envelope_updates(
+                1, attack=0.002, decay=0.22, sustain=0.0, release=0.08
+            ),
+            **_envelope_updates(
+                2, attack=0.0, decay=0.13, sustain=0.0, release=0.06
+            ),
+            "legato": 0.0,
+            "portamento_time": -10.0,
+        },
+        modulations=(
+            ModulationSpec("env_2", "filter_1_cutoff", 32.0 / 128.0),
+        ),
+    ),
+    "dark-reese": PresetRecipe(
+        slug="dark-reese",
+        preset_name="KDB Bass 04 - Dark Reese",
+        comments="Two subtly detuned saws through a dark 24 dB low-pass filter.",
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.27,
+                tune=-0.07,
+                pan=-0.12,
+            ),
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.27,
+                tune=0.07,
+                pan=0.12,
+            ),
+            **_filter_updates(
+                model=0.0, style=1.0, cutoff_hz=650.0, resonance=0.14, drive_db=2.0
+            ),
+            **_envelope_updates(
+                1, attack=0.005, decay=0.8, sustain=1.0, release=0.22
+            ),
+            "legato": 1.0,
+            "portamento_time": exponential_control_for_seconds(0.04),
+        },
+    ),
+    "driven-mid": PresetRecipe(
+        slug="driven-mid",
+        preset_name="KDB Bass 05 - Driven Mid Bass",
+        comments="Saw plus octave square through a driven filter and parallel soft clip.",
+        settings={
+            **_oscillator_updates(1, wave_frame=BASIC_SHAPES_SAW, audible_level=0.24),
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SQUARE,
+                audible_level=0.14,
+                transpose=12.0,
+                tune=0.03,
+            ),
+            **_filter_updates(
+                model=1.0, style=0.0, cutoff_hz=1200.0, resonance=0.12, drive_db=7.0
+            ),
+            **_envelope_updates(
+                1, attack=0.003, decay=0.45, sustain=0.82, release=0.12
+            ),
+            "distortion_on": 1.0,
+            "distortion_type": 0.0,
+            "distortion_drive": 6.0,
+            "distortion_mix": 0.35,
+            "distortion_filter_order": 0.0,
+            "legato": 0.0,
+            "portamento_time": -10.0,
+        },
+    ),
+    "long-808": PresetRecipe(
+        slug="long-808",
+        preset_name="KDB Bass 06 - Long 808",
+        comments="Long-decay sine 808 with a short pitch drop, subtle harmonics and legato glide.",
+        settings={
+            **_oscillator_updates(1, wave_frame=BASIC_SHAPES_SINE, audible_level=0.55),
+            **_oscillator_updates(
+                2, wave_frame=BASIC_SHAPES_SATURATED_SINE, audible_level=0.08
+            ),
+            **_envelope_updates(
+                1, attack=0.002, decay=1.8, sustain=0.0, release=0.25
+            ),
+            **_envelope_updates(
+                2, attack=0.0, decay=0.055, sustain=0.0, release=0.0
+            ),
+            "distortion_on": 1.0,
+            "distortion_type": 0.0,
+            "distortion_drive": 3.0,
+            "distortion_mix": 0.12,
+            "distortion_filter_order": 0.0,
+            "legato": 1.0,
+            "portamento_time": exponential_control_for_seconds(0.08),
+        },
+        modulations=(
+            ModulationSpec("env_2", "osc_1_transpose", 12.0 / 96.0),
+            ModulationSpec("env_2", "osc_2_transpose", 12.0 / 96.0),
+        ),
+    ),
+    "acid-pulse": PresetRecipe(
+        slug="acid-pulse",
+        preset_name="KDB Bass 07 - Acid Pulse",
+        comments="Monophonic saw through a resonant ladder filter with a fast acid envelope.",
+        settings={
+            **_oscillator_updates(1, wave_frame=BASIC_SHAPES_SAW, audible_level=0.38),
+            **_filter_updates(
+                model=2.0,
+                style=1.0,
+                cutoff_hz=160.0,
+                resonance=0.62,
+                drive_db=5.5,
+                keytrack=0.25,
+            ),
+            **_envelope_updates(
+                1, attack=0.002, decay=0.30, sustain=0.45, release=0.08
+            ),
+            **_envelope_updates(
+                2, attack=0.0, decay=0.18, sustain=0.0, release=0.08
+            ),
+            "distortion_on": 1.0,
+            "distortion_type": 0.0,
+            "distortion_drive": 4.0,
+            "distortion_mix": 0.18,
+            "distortion_filter_order": 0.0,
+            "legato": 1.0,
+            "portamento_time": exponential_control_for_seconds(0.05),
+        },
+        modulations=(
+            ModulationSpec("env_2", "filter_1_cutoff", 42.0 / 128.0),
+        ),
+    ),
+}
+
+
 def build_clean_sub(source: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
     """Return a Clean Sub clone plus the exact path allow-list."""
     result = copy.deepcopy(source)
@@ -226,6 +484,92 @@ def validate_clean_sub(preset: dict[str, Any]) -> None:
         raise PresetError(f"Clean Sub must have zero active modulations, found {active}")
     if preset["preset_name"] != "KDB Bass 01 - Clean Sub":
         raise PresetError("Clean Sub preset name invariant failed")
+
+
+def recipe_setting_updates(
+    source_settings: dict[str, Any], recipe: PresetRecipe
+) -> dict[str, float]:
+    updates = clean_sub_setting_updates(source_settings)
+    updates.update(recipe.settings)
+    for index, modulation in enumerate(recipe.modulations, start=1):
+        updates[f"modulation_{index}_amount"] = modulation.amount
+        for suffix in ("power", "bipolar", "stereo", "bypass"):
+            name = f"modulation_{index}_{suffix}"
+            if name in source_settings:
+                updates[name] = 0.0
+    return updates
+
+
+def _routes_for_recipe(routes: list[Any], recipe: PresetRecipe) -> list[dict[str, str]]:
+    result = _empty_modulation_routes(routes)
+    if len(recipe.modulations) > len(result):
+        raise PresetError(
+            f"Recipe {recipe.slug} needs {len(recipe.modulations)} modulation slots, "
+            f"source provides {len(result)}"
+        )
+    for index, modulation in enumerate(recipe.modulations):
+        result[index] = {
+            "source": modulation.source,
+            "destination": modulation.destination,
+        }
+    return result
+
+
+def build_recipe(
+    source: dict[str, Any], recipe: PresetRecipe
+) -> tuple[dict[str, Any], set[str]]:
+    """Build an allow-listed preset recipe from a known-good neutral seed."""
+    result = copy.deepcopy(source)
+    result.update(
+        {
+            "preset_name": recipe.preset_name,
+            "preset_style": "Bass",
+            "comments": recipe.comments,
+            "macro1": "MACRO 1",
+            "macro2": "MACRO 2",
+            "macro3": "MACRO 3",
+            "macro4": "MACRO 4",
+        }
+    )
+
+    settings = result["settings"]
+    updates = recipe_setting_updates(settings, recipe)
+    _require_setting_keys(settings, updates)
+    settings.update(updates)
+    settings["modulations"] = _routes_for_recipe(settings["modulations"], recipe)
+
+    allowed_paths = {
+        "preset_name",
+        "preset_style",
+        "comments",
+        "macro1",
+        "macro2",
+        "macro3",
+        "macro4",
+        "settings.modulations",
+    }
+    allowed_paths.update(f"settings.{name}" for name in updates)
+
+    validate_recipe(result, recipe)
+    assert_only_allowed_changes(source, result, allowed_paths)
+    return result, allowed_paths
+
+
+def validate_recipe(preset: dict[str, Any], recipe: PresetRecipe) -> None:
+    settings = preset["settings"]
+    expected = recipe_setting_updates(settings, recipe)
+    for name, wanted in expected.items():
+        actual = settings.get(name)
+        if not isinstance(actual, (int, float)) or not math.isclose(actual, wanted, abs_tol=1e-12):
+            raise PresetError(
+                f"Recipe {recipe.slug} invariant failed: {name}={actual!r}, wanted {wanted!r}"
+            )
+
+    wanted_routes = _routes_for_recipe(settings["modulations"], recipe)
+    if settings["modulations"] != wanted_routes:
+        raise PresetError(f"Recipe {recipe.slug} modulation routes failed validation")
+    if preset["preset_name"] != recipe.preset_name:
+        raise PresetError(f"Recipe {recipe.slug} preset name invariant failed")
 
 
 def changed_paths(before: Any, after: Any, prefix: str = "") -> set[str]:
@@ -364,6 +708,73 @@ def build_clean_sub_files(source_path: Path, output_path: Path, report_path: Pat
     return report
 
 
+def build_recipe_files(
+    source_path: Path,
+    output_path: Path,
+    report_path: Path,
+    recipe: PresetRecipe,
+) -> dict[str, Any]:
+    if output_path.exists():
+        raise PresetError(f"Refusing to overwrite existing file: {output_path}")
+    if report_path.exists():
+        raise PresetError(f"Refusing to overwrite existing report: {report_path}")
+
+    source = load_preset(source_path)
+    source_hash = sha256_path(source_path)
+    result, allowed_paths = build_recipe(source, recipe)
+
+    if output_path.stem != result["preset_name"]:
+        raise PresetError(
+            f"Output filename must match preset_name: expected '{result['preset_name']}.vital'"
+        )
+    if output_path.suffix.lower() != ".vital":
+        raise PresetError("Output file must use the .vital extension")
+
+    write_json_exclusive(output_path, result)
+    reloaded = load_preset(output_path)
+    validate_recipe(reloaded, recipe)
+    assert_only_allowed_changes(source, reloaded, allowed_paths)
+
+    report = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "recipe": recipe.slug,
+        "source": {
+            "path": str(source_path.resolve()),
+            "sha256": source_hash,
+            "preset_name": source["preset_name"],
+            "synth_version": source["synth_version"],
+        },
+        "output": {
+            "path": str(output_path.resolve()),
+            "sha256": sha256_path(output_path),
+            "preset_name": reloaded["preset_name"],
+            "synth_version": reloaded["synth_version"],
+            "bytes": output_path.stat().st_size,
+        },
+        "recipe_settings": recipe.settings,
+        "recipe_modulations": [
+            {
+                "source": modulation.source,
+                "destination": modulation.destination,
+                "amount": modulation.amount,
+            }
+            for modulation in recipe.modulations
+        ],
+        "invariants": {
+            "non_overwriting": True,
+            "only_allow_listed_paths_changed": True,
+            "sample_unchanged": source["settings"]["sample"] == reloaded["settings"]["sample"],
+            "wavetables_unchanged": source["settings"]["wavetables"]
+            == reloaded["settings"]["wavetables"],
+            "lfos_unchanged": source["settings"]["lfos"] == reloaded["settings"]["lfos"],
+            "active_modulations": _active_modulation_count(reloaded["settings"]["modulations"]),
+        },
+        "changes": scalar_change_report(source, reloaded),
+    }
+    write_report_exclusive(report_path, report)
+    return report
+
+
 def inspect_preset(path: Path) -> dict[str, Any]:
     preset = load_preset(path)
     settings = preset["settings"]
@@ -394,6 +805,12 @@ def _parser() -> argparse.ArgumentParser:
     clean.add_argument("--source", required=True, type=Path)
     clean.add_argument("--output", required=True, type=Path)
     clean.add_argument("--report", required=True, type=Path)
+
+    build = subparsers.add_parser("build", help="Build one named KDB bass preset recipe")
+    build.add_argument("--recipe", required=True, choices=sorted(ADDITIONAL_RECIPES))
+    build.add_argument("--source", required=True, type=Path)
+    build.add_argument("--output", required=True, type=Path)
+    build.add_argument("--report", required=True, type=Path)
     return parser
 
 
@@ -402,8 +819,15 @@ def main() -> int:
     try:
         if args.command == "inspect":
             result = inspect_preset(args.preset)
-        else:
+        elif args.command == "clean-sub":
             result = build_clean_sub_files(args.source, args.output, args.report)
+        else:
+            result = build_recipe_files(
+                args.source,
+                args.output,
+                args.report,
+                ADDITIONAL_RECIPES[args.recipe],
+            )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except PresetError as exc:

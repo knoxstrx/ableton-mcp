@@ -6,13 +6,19 @@ import unittest
 from pathlib import Path
 
 from tools.vital_preset import (
+    ADDITIONAL_RECIPES,
     CLEAN_SUB_OSC_1_AUDIBLE_LEVEL,
     CLEAN_SUB_SECONDS,
     EFFECT_SWITCHES,
     PresetError,
     build_clean_sub,
     build_clean_sub_files,
+    build_recipe,
+    build_recipe_files,
     changed_paths,
+    cutoff_control_for_hz,
+    exponential_control_for_seconds,
+    level_control_for_audible_level,
     quartic_control_for_seconds,
 )
 
@@ -66,6 +72,9 @@ def fixture() -> dict:
         "modulation_2_amount": 0.0,
     }
     settings.update({name: 0.0 for name in EFFECT_SWITCHES})
+    for recipe in ADDITIONAL_RECIPES.values():
+        for name in recipe.settings:
+            settings.setdefault(name, 0.0)
     return {
         "author": "Kilian Douglas Brune",
         "comments": "",
@@ -85,6 +94,11 @@ class VitalPresetTests(unittest.TestCase):
         for seconds in (0.0, 0.00544013, 0.101598, 0.47518):
             control = quartic_control_for_seconds(seconds)
             self.assertTrue(math.isclose(control**4, seconds, abs_tol=1e-12))
+
+    def test_other_parameter_conversions(self):
+        self.assertTrue(math.isclose(2 ** exponential_control_for_seconds(0.08), 0.08))
+        self.assertTrue(math.isclose(level_control_for_audible_level(0.38) ** 2, 0.38))
+        self.assertTrue(math.isclose(cutoff_control_for_hz(440.0), 69.0))
 
     def test_clean_sub_changes_only_allow_list(self):
         source = fixture()
@@ -133,6 +147,38 @@ class VitalPresetTests(unittest.TestCase):
         del source["settings"]["osc_2_on"]
         with self.assertRaisesRegex(PresetError, "osc_2_on"):
             build_clean_sub(source)
+
+    def test_every_additional_recipe_is_allow_listed_and_valid(self):
+        source = fixture()
+        for slug, recipe in ADDITIONAL_RECIPES.items():
+            with self.subTest(recipe=slug):
+                result, allowed = build_recipe(source, recipe)
+                self.assertFalse(changed_paths(source, result) - allowed)
+                self.assertEqual(result["preset_name"], recipe.preset_name)
+                self.assertEqual(result["settings"]["wavetables"], source["settings"]["wavetables"])
+                self.assertEqual(result["settings"]["sample"], source["settings"]["sample"])
+                self.assertEqual(result["settings"]["lfos"], source["settings"]["lfos"])
+                active = [
+                    route
+                    for route in result["settings"]["modulations"]
+                    if route["source"] and route["destination"]
+                ]
+                self.assertEqual(len(active), len(recipe.modulations))
+
+    def test_additional_recipe_file_builder_refuses_overwrite(self):
+        recipe = ADDITIONAL_RECIPES["short-pluck"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.vital"
+            output = root / f"{recipe.preset_name}.vital"
+            report = root / "report.json"
+            source.write_text(json.dumps(fixture()), encoding="utf-8")
+
+            first = build_recipe_files(source, output, report, recipe)
+            self.assertEqual(first["recipe"], "short-pluck")
+            self.assertEqual(first["invariants"]["active_modulations"], 1)
+            with self.assertRaises(PresetError):
+                build_recipe_files(source, output, root / "second-report.json", recipe)
 
 
 if __name__ == "__main__":
