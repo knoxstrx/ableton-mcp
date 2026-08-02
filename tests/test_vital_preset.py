@@ -187,7 +187,7 @@ class VitalPresetTests(unittest.TestCase):
 
         self.assertEqual(
             (result["macro1"], result["macro2"], result["macro3"], result["macro4"]),
-            ("TONE", "MOTION", "DIRT", "FOCUS"),
+            ("TONE", "MOTION", "DIRT", "WIDTH"),
         )
         self.assertEqual(settings["macro_control_1"], 0.0)
         self.assertEqual(settings["macro_control_2"], 0.0)
@@ -197,6 +197,9 @@ class VitalPresetTests(unittest.TestCase):
         self.assertEqual(settings["distortion_mix"], 0.0)
         self.assertEqual(settings["lfo_1_tempo"], 5.0)
         self.assertEqual(settings["lfo_1_sync_type"], 1.0)
+        self.assertTrue(math.isclose(2 ** settings["portamento_time"], 0.18))
+        self.assertEqual(settings["modulation_6_amount"], -0.24)
+        self.assertEqual(settings["modulation_7_amount"], 0.24)
 
     def test_additional_recipe_file_builder_refuses_overwrite(self):
         recipe = ADDITIONAL_RECIPES["short-pluck"]

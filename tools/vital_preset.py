@@ -324,7 +324,7 @@ ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
         preset_name="KDB Bass 04 - Dark Reese",
         comments=(
             "Two subtly detuned saws through a dark 24 dB low-pass filter. "
-            "Macros add tone, slow motion, dirt and mono focus."
+            "Macros add tone, slow motion, dirt and optional width."
         ),
         settings={
             **_oscillator_updates(
@@ -357,7 +357,7 @@ ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
             "distortion_mix": 0.0,
             "distortion_filter_order": 0.0,
             "legato": 1.0,
-            "portamento_time": exponential_control_for_seconds(0.04),
+            "portamento_time": exponential_control_for_seconds(0.18),
         },
         modulations=(
             ModulationSpec("macro_control_1", "filter_1_cutoff", 24.0 / 128.0),
@@ -365,10 +365,10 @@ ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
             ModulationSpec("macro_control_2", "modulation_2_amount", 10.0 / 128.0),
             ModulationSpec("macro_control_3", "filter_1_drive", 0.25),
             ModulationSpec("macro_control_3", "distortion_mix", 0.30),
-            ModulationSpec("macro_control_4", "osc_1_pan", 0.06),
-            ModulationSpec("macro_control_4", "osc_2_pan", -0.06),
+            ModulationSpec("macro_control_4", "osc_1_pan", -0.24),
+            ModulationSpec("macro_control_4", "osc_2_pan", 0.24),
         ),
-        macros=("TONE", "MOTION", "DIRT", "FOCUS"),
+        macros=("TONE", "MOTION", "DIRT", "WIDTH"),
     ),
     "driven-mid": PresetRecipe(
         slug="driven-mid",
