@@ -24,10 +24,14 @@ from tools.vital_preset import (
 
 
 def fixture() -> dict:
+    modulation_slots = 64
     settings = {
         "modulations": [
             {"source": "env_2", "destination": "filter_1_cutoff"},
-            {"source": "", "destination": ""},
+            *(
+                {"source": "", "destination": ""}
+                for _ in range(modulation_slots - 1)
+            ),
         ],
         "wavetables": [{"opaque": "wave-data"}],
         "lfos": [{"opaque": "lfo-data"}],
@@ -68,10 +72,14 @@ def fixture() -> dict:
         "macro_control_3": 0.0,
         "macro_control_4": 0.0,
         "mpe_enabled": 0.0,
-        "modulation_1_amount": 0.15,
-        "modulation_2_amount": 0.0,
     }
     settings.update({name: 0.0 for name in EFFECT_SWITCHES})
+    settings.update(
+        {
+            f"modulation_{index}_amount": 0.15 if index == 1 else 0.0
+            for index in range(1, modulation_slots + 1)
+        }
+    )
     for recipe in ADDITIONAL_RECIPES.values():
         for name in recipe.settings:
             settings.setdefault(name, 0.0)
@@ -125,7 +133,10 @@ class VitalPresetTests(unittest.TestCase):
             self.assertTrue(math.isclose(result["settings"][key] ** 4, seconds, abs_tol=1e-12))
         self.assertEqual(
             result["settings"]["modulations"],
-            [{"source": "", "destination": ""}, {"source": "", "destination": ""}],
+            [
+                {"source": "", "destination": ""}
+                for _ in source["settings"]["modulations"]
+            ],
         )
 
     def test_file_builder_refuses_overwrite(self):
@@ -155,6 +166,10 @@ class VitalPresetTests(unittest.TestCase):
                 result, allowed = build_recipe(source, recipe)
                 self.assertFalse(changed_paths(source, result) - allowed)
                 self.assertEqual(result["preset_name"], recipe.preset_name)
+                self.assertEqual(
+                    tuple(result[f"macro{index}"] for index in range(1, 5)),
+                    recipe.macros,
+                )
                 self.assertEqual(result["settings"]["wavetables"], source["settings"]["wavetables"])
                 self.assertEqual(result["settings"]["sample"], source["settings"]["sample"])
                 self.assertEqual(result["settings"]["lfos"], source["settings"]["lfos"])
@@ -164,6 +179,24 @@ class VitalPresetTests(unittest.TestCase):
                     if route["source"] and route["destination"]
                 ]
                 self.assertEqual(len(active), len(recipe.modulations))
+
+    def test_dark_reese_macros_preserve_the_zero_position_sound(self):
+        source = fixture()
+        result, _ = build_recipe(source, ADDITIONAL_RECIPES["dark-reese"])
+        settings = result["settings"]
+
+        self.assertEqual(
+            (result["macro1"], result["macro2"], result["macro3"], result["macro4"]),
+            ("TONE", "MOTION", "DIRT", "FOCUS"),
+        )
+        self.assertEqual(settings["macro_control_1"], 0.0)
+        self.assertEqual(settings["macro_control_2"], 0.0)
+        self.assertEqual(settings["macro_control_3"], 0.0)
+        self.assertEqual(settings["macro_control_4"], 0.0)
+        self.assertEqual(settings["modulation_2_amount"], 0.0)
+        self.assertEqual(settings["distortion_mix"], 0.0)
+        self.assertEqual(settings["lfo_1_tempo"], 5.0)
+        self.assertEqual(settings["lfo_1_sync_type"], 1.0)
 
     def test_additional_recipe_file_builder_refuses_overwrite(self):
         recipe = ADDITIONAL_RECIPES["short-pluck"]

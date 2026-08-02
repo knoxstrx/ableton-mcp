@@ -83,6 +83,12 @@ class PresetRecipe:
     comments: str
     settings: dict[str, float]
     modulations: tuple[ModulationSpec, ...] = ()
+    macros: tuple[str, str, str, str] = (
+        "MACRO 1",
+        "MACRO 2",
+        "MACRO 3",
+        "MACRO 4",
+    )
 
 
 def sha256_path(path: Path) -> str:
@@ -316,7 +322,10 @@ ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
     "dark-reese": PresetRecipe(
         slug="dark-reese",
         preset_name="KDB Bass 04 - Dark Reese",
-        comments="Two subtly detuned saws through a dark 24 dB low-pass filter.",
+        comments=(
+            "Two subtly detuned saws through a dark 24 dB low-pass filter. "
+            "Macros add tone, slow motion, dirt and mono focus."
+        ),
         settings={
             **_oscillator_updates(
                 1,
@@ -338,9 +347,28 @@ ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
             **_envelope_updates(
                 1, attack=0.005, decay=0.8, sustain=1.0, release=0.22
             ),
+            "lfo_1_sync": 1.0,
+            "lfo_1_sync_type": 1.0,
+            "lfo_1_tempo": 5.0,
+            "lfo_1_phase": 0.0,
+            "distortion_on": 1.0,
+            "distortion_type": 0.0,
+            "distortion_drive": 5.0,
+            "distortion_mix": 0.0,
+            "distortion_filter_order": 0.0,
             "legato": 1.0,
             "portamento_time": exponential_control_for_seconds(0.04),
         },
+        modulations=(
+            ModulationSpec("macro_control_1", "filter_1_cutoff", 24.0 / 128.0),
+            ModulationSpec("lfo_1", "filter_1_cutoff", 0.0),
+            ModulationSpec("macro_control_2", "modulation_2_amount", 10.0 / 128.0),
+            ModulationSpec("macro_control_3", "filter_1_drive", 0.25),
+            ModulationSpec("macro_control_3", "distortion_mix", 0.30),
+            ModulationSpec("macro_control_4", "osc_1_pan", 0.06),
+            ModulationSpec("macro_control_4", "osc_2_pan", -0.06),
+        ),
+        macros=("TONE", "MOTION", "DIRT", "FOCUS"),
     ),
     "driven-mid": PresetRecipe(
         slug="driven-mid",
@@ -525,10 +553,10 @@ def build_recipe(
             "preset_name": recipe.preset_name,
             "preset_style": "Bass",
             "comments": recipe.comments,
-            "macro1": "MACRO 1",
-            "macro2": "MACRO 2",
-            "macro3": "MACRO 3",
-            "macro4": "MACRO 4",
+            "macro1": recipe.macros[0],
+            "macro2": recipe.macros[1],
+            "macro3": recipe.macros[2],
+            "macro4": recipe.macros[3],
         }
     )
 
@@ -570,6 +598,11 @@ def validate_recipe(preset: dict[str, Any], recipe: PresetRecipe) -> None:
         raise PresetError(f"Recipe {recipe.slug} modulation routes failed validation")
     if preset["preset_name"] != recipe.preset_name:
         raise PresetError(f"Recipe {recipe.slug} preset name invariant failed")
+    actual_macros = tuple(preset[f"macro{index}"] for index in range(1, 5))
+    if actual_macros != recipe.macros:
+        raise PresetError(
+            f"Recipe {recipe.slug} macro labels failed validation: {actual_macros!r}"
+        )
 
 
 def changed_paths(before: Any, after: Any, prefix: str = "") -> set[str]:
@@ -760,6 +793,7 @@ def build_recipe_files(
             }
             for modulation in recipe.modulations
         ],
+        "recipe_macros": list(recipe.macros),
         "invariants": {
             "non_overwriting": True,
             "only_allow_listed_paths_changed": True,
