@@ -5,8 +5,8 @@ known-good user preset instead of trying to synthesize the whole document from
 scratch. It refuses to overwrite output files, validates every changed path,
 and emits a machine-readable report.
 
-The first supported recipe is the H24 Clean Sub proof. More recipes should be
-added only after this one loads successfully in Vital and is approved by ear.
+The first supported recipe was the H24 Clean Sub proof. Every later recipe uses
+the same non-overwriting, allow-listed and diffed workflow.
 """
 
 from __future__ import annotations
@@ -82,6 +82,7 @@ class PresetRecipe:
     preset_name: str
     comments: str
     settings: dict[str, float]
+    preset_style: str = "Bass"
     modulations: tuple[ModulationSpec, ...] = ()
     macros: tuple[str, str, str, str] = (
         "MACRO 1",
@@ -146,6 +147,13 @@ def level_control_for_audible_level(level: float) -> float:
     if not 0.0 <= level <= 1.0:
         raise PresetError("Audible oscillator level must be between zero and one")
     return math.sqrt(level)
+
+
+def unison_detune_control_for_percent(percent: float) -> float:
+    """Convert displayed unison-detune percent to Vital's quadratic control."""
+    if not 0.0 <= percent <= 100.0:
+        raise PresetError("Unison detune must be between zero and 100 percent")
+    return math.sqrt(percent)
 
 
 def cutoff_control_for_hz(frequency_hz: float) -> float:
@@ -296,6 +304,77 @@ def _filter_updates(
 
 
 ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
+    "warm-foundation": PresetRecipe(
+        slug="warm-foundation",
+        preset_name="KDB Pad 01 - Warm Foundation",
+        preset_style="Pad",
+        comments=(
+            "Warm, gently moving analog pad for dependable sustained chord support. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.26,
+                tune=-0.03,
+                pan=-0.08,
+            ),
+            "osc_1_unison_voices": 4.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(7.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_TRIANGLE,
+                audible_level=0.14,
+                transpose=12.0,
+                tune=0.03,
+                pan=0.08,
+            ),
+            "osc_2_unison_voices": 3.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(5.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=0.0,
+                cutoff_hz=1400.0,
+                resonance=0.10,
+                drive_db=1.5,
+                keytrack=0.20,
+            ),
+            **_envelope_updates(
+                1, attack=0.75, decay=2.4, sustain=0.78, release=3.2
+            ),
+            "polyphony": 8.0,
+            "chorus_on": 1.0,
+            "chorus_dry_wet": 0.16,
+            "chorus_feedback": 0.20,
+            "chorus_mod_depth": 0.25,
+            "chorus_spread": 1.0,
+            "chorus_sync": 0.0,
+            "chorus_frequency": -3.0,
+            "reverb_on": 1.0,
+            "reverb_dry_wet": 0.08,
+            "reverb_decay_time": exponential_control_for_seconds(3.0),
+            "reverb_size": 0.65,
+            "reverb_pre_low_cutoff": cutoff_control_for_hz(180.0),
+            "lfo_1_sync": 1.0,
+            "lfo_1_sync_type": 0.0,
+            "lfo_1_tempo": 5.0,
+            "lfo_1_phase": 0.0,
+            "legato": 0.0,
+            "portamento_time": -10.0,
+        },
+        modulations=(
+            ModulationSpec("macro_control_1", "filter_1_cutoff", 24.0 / 128.0),
+            ModulationSpec("lfo_1", "filter_1_cutoff", 2.5 / 128.0),
+            ModulationSpec("macro_control_2", "modulation_2_amount", 8.0 / 128.0),
+            ModulationSpec("macro_control_3", "reverb_dry_wet", 0.30),
+            ModulationSpec("macro_control_4", "osc_1_pan", -0.22),
+            ModulationSpec("macro_control_4", "osc_2_pan", 0.22),
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
     "short-pluck": PresetRecipe(
         slug="short-pluck",
         preset_name="KDB Bass 03 - Short Pluck",
@@ -551,7 +630,7 @@ def build_recipe(
     result.update(
         {
             "preset_name": recipe.preset_name,
-            "preset_style": "Bass",
+            "preset_style": recipe.preset_style,
             "comments": recipe.comments,
             "macro1": recipe.macros[0],
             "macro2": recipe.macros[1],
@@ -840,7 +919,7 @@ def _parser() -> argparse.ArgumentParser:
     clean.add_argument("--output", required=True, type=Path)
     clean.add_argument("--report", required=True, type=Path)
 
-    build = subparsers.add_parser("build", help="Build one named KDB bass preset recipe")
+    build = subparsers.add_parser("build", help="Build one named KDB preset recipe")
     build.add_argument("--recipe", required=True, choices=sorted(ADDITIONAL_RECIPES))
     build.add_argument("--source", required=True, type=Path)
     build.add_argument("--output", required=True, type=Path)

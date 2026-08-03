@@ -20,6 +20,7 @@ from tools.vital_preset import (
     exponential_control_for_seconds,
     level_control_for_audible_level,
     quartic_control_for_seconds,
+    unison_detune_control_for_percent,
 )
 
 
@@ -106,6 +107,7 @@ class VitalPresetTests(unittest.TestCase):
     def test_other_parameter_conversions(self):
         self.assertTrue(math.isclose(2 ** exponential_control_for_seconds(0.08), 0.08))
         self.assertTrue(math.isclose(level_control_for_audible_level(0.38) ** 2, 0.38))
+        self.assertTrue(math.isclose(unison_detune_control_for_percent(7.0) ** 2, 7.0))
         self.assertTrue(math.isclose(cutoff_control_for_hz(440.0), 69.0))
 
     def test_clean_sub_changes_only_allow_list(self):
@@ -166,6 +168,7 @@ class VitalPresetTests(unittest.TestCase):
                 result, allowed = build_recipe(source, recipe)
                 self.assertFalse(changed_paths(source, result) - allowed)
                 self.assertEqual(result["preset_name"], recipe.preset_name)
+                self.assertEqual(result["preset_style"], recipe.preset_style)
                 self.assertEqual(
                     tuple(result[f"macro{index}"] for index in range(1, 5)),
                     recipe.macros,
@@ -179,6 +182,38 @@ class VitalPresetTests(unittest.TestCase):
                     if route["source"] and route["destination"]
                 ]
                 self.assertEqual(len(active), len(recipe.modulations))
+
+    def test_warm_foundation_is_a_polyphonic_pad_with_neutral_macros(self):
+        source = fixture()
+        result, _ = build_recipe(source, ADDITIONAL_RECIPES["warm-foundation"])
+        settings = result["settings"]
+
+        self.assertEqual(result["preset_style"], "Pad")
+        self.assertEqual(
+            (result["macro1"], result["macro2"], result["macro3"], result["macro4"]),
+            ("TONE", "MOTION", "SPACE", "WIDTH"),
+        )
+        self.assertEqual(settings["polyphony"], 8.0)
+        self.assertEqual(settings["osc_1_unison_voices"], 4.0)
+        self.assertEqual(settings["osc_2_unison_voices"], 3.0)
+        self.assertTrue(math.isclose(settings["osc_1_unison_detune"] ** 2, 7.0))
+        self.assertTrue(math.isclose(settings["osc_2_unison_detune"] ** 2, 5.0))
+        self.assertTrue(math.isclose(settings["env_1_attack"] ** 4, 0.75))
+        self.assertTrue(math.isclose(settings["env_1_release"] ** 4, 3.2))
+        self.assertEqual(settings["chorus_on"], 1.0)
+        self.assertEqual(settings["reverb_on"], 1.0)
+        self.assertTrue(math.isclose(2 ** settings["reverb_decay_time"], 3.0))
+        self.assertEqual(
+            tuple(settings[f"macro_control_{index}"] for index in range(1, 5)),
+            (0.0, 0.0, 0.0, 0.0),
+        )
+        active = [
+            route
+            for route in settings["modulations"]
+            if route["source"] and route["destination"]
+        ]
+        self.assertEqual(len(active), 6)
+        self.assertEqual(settings["modulation_2_amount"], 2.5 / 128.0)
 
     def test_dark_reese_macros_preserve_the_zero_position_sound(self):
         source = fixture()
