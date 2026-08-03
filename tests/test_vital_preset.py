@@ -215,6 +215,69 @@ class VitalPresetTests(unittest.TestCase):
         self.assertEqual(len(active), 6)
         self.assertEqual(settings["modulation_2_amount"], 2.5 / 128.0)
 
+    def test_pad_bank_is_complete_distinct_and_neutral(self):
+        pad_slugs = (
+            "warm-foundation",
+            "air-glass",
+            "soft-focus",
+            "dub-chord-cloud",
+            "dark-drape",
+            "slow-machine",
+            "industrial-haze",
+            "night-swarm",
+        )
+        expected_names = tuple(
+            f"KDB Pad {index:02d} - {name}"
+            for index, name in enumerate(
+                (
+                    "Warm Foundation",
+                    "Air Glass",
+                    "Soft Focus",
+                    "Dub Chord Cloud",
+                    "Dark Drape",
+                    "Slow Machine",
+                    "Industrial Haze",
+                    "Night Swarm",
+                ),
+                start=1,
+            )
+        )
+        source = fixture()
+        fingerprints = set()
+
+        for slug, expected_name in zip(pad_slugs, expected_names):
+            recipe = ADDITIONAL_RECIPES[slug]
+            result, _ = build_recipe(source, recipe)
+            settings = result["settings"]
+
+            self.assertEqual(recipe.preset_name, expected_name)
+            self.assertEqual(result["preset_style"], "Pad")
+            self.assertEqual(recipe.macros, ("TONE", "MOTION", "SPACE", "WIDTH"))
+            self.assertGreaterEqual(settings["polyphony"], 8.0)
+            self.assertEqual(settings["osc_1_on"], 1.0)
+            self.assertEqual(settings["osc_2_on"], 1.0)
+            self.assertEqual(settings["osc_3_on"], 0.0)
+            self.assertEqual(settings["sample_on"], 0.0)
+            self.assertEqual(settings["filter_1_on"], 1.0)
+            self.assertEqual(settings["filter_2_on"], 0.0)
+            self.assertEqual(
+                tuple(settings[f"macro_control_{index}"] for index in range(1, 5)),
+                (0.0, 0.0, 0.0, 0.0),
+            )
+            fingerprints.add(
+                json.dumps(
+                    {
+                        "settings": recipe.settings,
+                        "modulations": [
+                            modulation.__dict__ for modulation in recipe.modulations
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+
+        self.assertEqual(len(fingerprints), len(pad_slugs))
+
     def test_dark_reese_macros_preserve_the_zero_position_sound(self):
         source = fixture()
         result, _ = build_recipe(source, ADDITIONAL_RECIPES["dark-reese"])

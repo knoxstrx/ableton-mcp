@@ -303,6 +303,63 @@ def _filter_updates(
     }
 
 
+def _pad_effect_updates(
+    *,
+    chorus_mix: float,
+    reverb_mix: float,
+    reverb_seconds: float,
+    reverb_size: float,
+) -> dict[str, float]:
+    """Return the calibrated common chorus/reverb block for a pad recipe."""
+    return {
+        "chorus_on": 1.0 if chorus_mix > 0.0 else 0.0,
+        "chorus_dry_wet": chorus_mix,
+        "chorus_feedback": 0.20,
+        "chorus_mod_depth": 0.25,
+        "chorus_spread": 1.0,
+        "chorus_sync": 0.0,
+        "chorus_frequency": -3.0,
+        "reverb_on": 1.0,
+        "reverb_dry_wet": reverb_mix,
+        "reverb_decay_time": exponential_control_for_seconds(reverb_seconds),
+        "reverb_size": reverb_size,
+        "reverb_pre_low_cutoff": cutoff_control_for_hz(180.0),
+    }
+
+
+def _pad_lfo_updates(*, tempo: float) -> dict[str, float]:
+    """Use the seed's verified Triangle LFO 1 as a host-synced pad modulator."""
+    return {
+        "lfo_1_sync": 1.0,
+        "lfo_1_sync_type": 0.0,
+        "lfo_1_tempo": tempo,
+        "lfo_1_phase": 0.0,
+    }
+
+
+def _pad_macro_modulations(
+    *,
+    base_motion_semitones: float,
+    added_motion_semitones: float,
+    space_amount: float,
+    width_amount: float,
+) -> tuple[ModulationSpec, ...]:
+    return (
+        ModulationSpec("macro_control_1", "filter_1_cutoff", 24.0 / 128.0),
+        ModulationSpec(
+            "lfo_1", "filter_1_cutoff", base_motion_semitones / 128.0
+        ),
+        ModulationSpec(
+            "macro_control_2",
+            "modulation_2_amount",
+            added_motion_semitones / 128.0,
+        ),
+        ModulationSpec("macro_control_3", "reverb_dry_wet", space_amount),
+        ModulationSpec("macro_control_4", "osc_1_pan", -width_amount),
+        ModulationSpec("macro_control_4", "osc_2_pan", width_amount),
+    )
+
+
 ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
     "warm-foundation": PresetRecipe(
         slug="warm-foundation",
@@ -372,6 +429,417 @@ ADDITIONAL_RECIPES: dict[str, PresetRecipe] = {
             ModulationSpec("macro_control_3", "reverb_dry_wet", 0.30),
             ModulationSpec("macro_control_4", "osc_1_pan", -0.22),
             ModulationSpec("macro_control_4", "osc_2_pan", 0.22),
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "air-glass": PresetRecipe(
+        slug="air-glass",
+        preset_name="KDB Pad 02 - Air Glass",
+        preset_style="Pad",
+        comments=(
+            "Bright upper-register glass pad that leaves the low end clear. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_TRIANGLE,
+                audible_level=0.20,
+                transpose=12.0,
+                tune=-0.02,
+                pan=-0.10,
+            ),
+            "osc_1_unison_voices": 4.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(8.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SQUARE,
+                audible_level=0.055,
+                transpose=24.0,
+                tune=0.02,
+                pan=0.10,
+            ),
+            "osc_2_unison_voices": 2.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(5.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=0.0,
+                cutoff_hz=5600.0,
+                resonance=0.08,
+                drive_db=0.5,
+                keytrack=0.25,
+            ),
+            **_envelope_updates(
+                1, attack=0.42, decay=2.8, sustain=0.72, release=4.8
+            ),
+            "polyphony": 8.0,
+            **_pad_effect_updates(
+                chorus_mix=0.22,
+                reverb_mix=0.20,
+                reverb_seconds=5.0,
+                reverb_size=0.80,
+            ),
+            **_pad_lfo_updates(tempo=5.0),
+        },
+        modulations=_pad_macro_modulations(
+            base_motion_semitones=1.5,
+            added_motion_semitones=6.0,
+            space_amount=0.28,
+            width_amount=0.20,
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "soft-focus": PresetRecipe(
+        slug="soft-focus",
+        preset_name="KDB Pad 03 - Soft Focus",
+        preset_style="Pad",
+        comments=(
+            "Muted, narrow pad for supporting a busy arrangement without taking over. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_TRIANGLE,
+                audible_level=0.25,
+                pan=-0.02,
+            ),
+            "osc_1_unison_voices": 2.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(3.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SINE,
+                audible_level=0.10,
+                transpose=12.0,
+                pan=0.02,
+            ),
+            "osc_2_unison_voices": 1.0,
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=1.0,
+                cutoff_hz=850.0,
+                resonance=0.08,
+                drive_db=1.0,
+                keytrack=0.15,
+            ),
+            **_envelope_updates(
+                1, attack=0.55, decay=1.8, sustain=0.76, release=2.3
+            ),
+            "polyphony": 8.0,
+            **_pad_effect_updates(
+                chorus_mix=0.0,
+                reverb_mix=0.06,
+                reverb_seconds=2.5,
+                reverb_size=0.55,
+            ),
+            **_pad_lfo_updates(tempo=5.0),
+        },
+        modulations=_pad_macro_modulations(
+            base_motion_semitones=0.75,
+            added_motion_semitones=5.0,
+            space_amount=0.24,
+            width_amount=0.28,
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "dub-chord-cloud": PresetRecipe(
+        slug="dub-chord-cloud",
+        preset_name="KDB Pad 04 - Dub Chord Cloud",
+        preset_style="Pad",
+        comments=(
+            "Dark chord-stab body with a floating tail for dub and techno accents. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.28,
+                tune=-0.02,
+                pan=-0.07,
+            ),
+            "osc_1_unison_voices": 2.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(5.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SATURATED_SINE,
+                audible_level=0.11,
+                transpose=12.0,
+                tune=0.02,
+                pan=0.07,
+            ),
+            "osc_2_unison_voices": 2.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(4.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=1.0,
+                cutoff_hz=450.0,
+                resonance=0.22,
+                drive_db=3.5,
+                keytrack=0.20,
+            ),
+            **_envelope_updates(
+                1, attack=0.015, decay=1.1, sustain=0.18, release=2.6
+            ),
+            **_envelope_updates(
+                2, attack=0.0, decay=0.22, sustain=0.0, release=0.15
+            ),
+            "polyphony": 8.0,
+            **_pad_effect_updates(
+                chorus_mix=0.08,
+                reverb_mix=0.16,
+                reverb_seconds=4.0,
+                reverb_size=0.72,
+            ),
+            **_pad_lfo_updates(tempo=5.0),
+        },
+        modulations=(
+            ModulationSpec("env_2", "filter_1_cutoff", 30.0 / 128.0),
+            ModulationSpec("macro_control_1", "filter_1_cutoff", 24.0 / 128.0),
+            ModulationSpec("lfo_1", "filter_1_cutoff", 0.0),
+            ModulationSpec("macro_control_2", "modulation_3_amount", 8.0 / 128.0),
+            ModulationSpec("macro_control_3", "reverb_dry_wet", 0.32),
+            ModulationSpec("macro_control_4", "osc_1_pan", -0.20),
+            ModulationSpec("macro_control_4", "osc_2_pan", 0.20),
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "dark-drape": PresetRecipe(
+        slug="dark-drape",
+        preset_name="KDB Pad 05 - Dark Drape",
+        preset_style="Pad",
+        comments=(
+            "Low, filtered, slowly breathing techno atmosphere without a hard pulse. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.23,
+                tune=-0.05,
+                pan=-0.12,
+            ),
+            "osc_1_unison_voices": 5.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(9.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_TRIANGLE,
+                audible_level=0.15,
+                tune=0.05,
+                pan=0.12,
+            ),
+            "osc_2_unison_voices": 4.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(7.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=1.0,
+                cutoff_hz=380.0,
+                resonance=0.16,
+                drive_db=2.5,
+                keytrack=0.10,
+            ),
+            **_envelope_updates(
+                1, attack=1.4, decay=3.0, sustain=0.82, release=4.8
+            ),
+            "polyphony": 8.0,
+            **_pad_effect_updates(
+                chorus_mix=0.12,
+                reverb_mix=0.10,
+                reverb_seconds=4.5,
+                reverb_size=0.75,
+            ),
+            **_pad_lfo_updates(tempo=5.0),
+        },
+        modulations=_pad_macro_modulations(
+            base_motion_semitones=4.0,
+            added_motion_semitones=10.0,
+            space_amount=0.30,
+            width_amount=0.22,
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "slow-machine": PresetRecipe(
+        slug="slow-machine",
+        preset_name="KDB Pad 06 - Slow Machine",
+        preset_style="Pad",
+        comments=(
+            "Half-note filter movement turns sustained chords into a restrained machine pulse. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SQUARE,
+                audible_level=0.20,
+                pan=-0.08,
+            ),
+            "osc_1_unison_voices": 2.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(3.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_TRIANGLE,
+                audible_level=0.12,
+                transpose=12.0,
+                pan=0.08,
+            ),
+            "osc_2_unison_voices": 3.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(5.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=0.0,
+                cutoff_hz=900.0,
+                resonance=0.18,
+                drive_db=2.0,
+                keytrack=0.18,
+            ),
+            **_envelope_updates(
+                1, attack=0.12, decay=1.4, sustain=0.72, release=1.6
+            ),
+            "polyphony": 8.0,
+            **_pad_effect_updates(
+                chorus_mix=0.10,
+                reverb_mix=0.06,
+                reverb_seconds=2.5,
+                reverb_size=0.58,
+            ),
+            **_pad_lfo_updates(tempo=7.0),
+        },
+        modulations=_pad_macro_modulations(
+            base_motion_semitones=12.0,
+            added_motion_semitones=12.0,
+            space_amount=0.24,
+            width_amount=0.22,
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "industrial-haze": PresetRecipe(
+        slug="industrial-haze",
+        preset_name="KDB Pad 07 - Industrial Haze",
+        preset_style="Pad",
+        comments=(
+            "Driven metallic haze for tense transitions and sparse industrial sections. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.22,
+                tune=-0.09,
+                pan=-0.15,
+            ),
+            "osc_1_unison_voices": 5.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(13.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SQUARE,
+                audible_level=0.10,
+                transpose=12.0,
+                tune=0.09,
+                pan=0.15,
+            ),
+            "osc_2_unison_voices": 4.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(11.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=1.0,
+                style=0.0,
+                cutoff_hz=1200.0,
+                resonance=0.20,
+                drive_db=6.0,
+                keytrack=0.20,
+            ),
+            **_envelope_updates(
+                1, attack=0.65, decay=2.0, sustain=0.70, release=3.6
+            ),
+            "polyphony": 8.0,
+            "distortion_on": 1.0,
+            "distortion_type": 0.0,
+            "distortion_drive": 5.0,
+            "distortion_mix": 0.16,
+            "distortion_filter_order": 0.0,
+            **_pad_effect_updates(
+                chorus_mix=0.18,
+                reverb_mix=0.16,
+                reverb_seconds=4.0,
+                reverb_size=0.78,
+            ),
+            **_pad_lfo_updates(tempo=7.0),
+        },
+        modulations=_pad_macro_modulations(
+            base_motion_semitones=4.0,
+            added_motion_semitones=12.0,
+            space_amount=0.28,
+            width_amount=0.20,
+        ),
+        macros=("TONE", "MOTION", "SPACE", "WIDTH"),
+    ),
+    "night-swarm": PresetRecipe(
+        slug="night-swarm",
+        preset_name="KDB Pad 08 - Night Swarm",
+        preset_style="Pad",
+        comments=(
+            "Wide, unstable and ominous peak-layer pad for the darkest sections. "
+            "Macros add tone, motion, space and width."
+        ),
+        settings={
+            **_oscillator_updates(
+                1,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.22,
+                tune=-0.12,
+                pan=-0.18,
+            ),
+            "osc_1_unison_voices": 7.0,
+            "osc_1_unison_detune": unison_detune_control_for_percent(17.0),
+            "osc_1_random_phase": 1.0,
+            **_oscillator_updates(
+                2,
+                wave_frame=BASIC_SHAPES_SAW,
+                audible_level=0.18,
+                tune=0.12,
+                pan=0.18,
+            ),
+            "osc_2_unison_voices": 6.0,
+            "osc_2_unison_detune": unison_detune_control_for_percent(14.0),
+            "osc_2_random_phase": 1.0,
+            **_filter_updates(
+                model=0.0,
+                style=1.0,
+                cutoff_hz=600.0,
+                resonance=0.22,
+                drive_db=3.0,
+                keytrack=0.12,
+            ),
+            **_envelope_updates(
+                1, attack=1.8, decay=4.0, sustain=0.86, release=6.0
+            ),
+            "polyphony": 8.0,
+            **_pad_effect_updates(
+                chorus_mix=0.25,
+                reverb_mix=0.20,
+                reverb_seconds=6.0,
+                reverb_size=0.85,
+            ),
+            **_pad_lfo_updates(tempo=5.0),
+        },
+        modulations=_pad_macro_modulations(
+            base_motion_semitones=6.0,
+            added_motion_semitones=12.0,
+            space_amount=0.30,
+            width_amount=0.20,
         ),
         macros=("TONE", "MOTION", "SPACE", "WIDTH"),
     ),
