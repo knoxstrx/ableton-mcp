@@ -1,0 +1,44 @@
+# Line endings.
+#
+# Kilian's development environment is moving to Pop OS on a second SSD while
+# Windows keeps Ableton. The same repositories will be checked out on both, so
+# the repository stores LF and hands out LF everywhere. Without this, Windows
+# checkouts convert to CRLF and Linux checkouts do not, and the first commit
+# from the other side shows up as a whole-file rewrite.
+#
+# This replaces relying on the global core.autocrlf=true setting, which is a
+# per-machine preference and therefore cannot be trusted to match on both.
+
+* text=auto eol=lf
+
+# Windows-only scripts that genuinely require CRLF to run.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binary: never convert, never diff as text.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+
+# Audio and Ableton/Vital assets. These must never be touched by EOL
+# conversion; an .als is gzipped XML and a single byte change corrupts it.
+*.wav   binary
+*.aif   binary
+*.aiff  binary
+*.mp3   binary
+*.flac  binary
+*.als   binary
+*.alp   binary
+*.adv   binary
+*.adg   binary
+*.asd   binary
+*.vital binary
+
+# Python bytecode should not be committed at all, but be explicit.
+*.pyc   binary
